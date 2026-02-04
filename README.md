@@ -179,7 +179,7 @@ Connect to `/ws/hub` with device token authentication.
 {
   "type": "telemetry",
   "hubId": "rpi-bridge-01",
-  "timestamp": "2024-01-03T12:00:00Z",
+  "timestamp": "2025-01-03T12:00:00Z",
   "portId": "port-abc123",
   "sessionId": "session-xyz",
   "data": "base64-encoded-serial-data"
