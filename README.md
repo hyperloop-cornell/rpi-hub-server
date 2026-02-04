@@ -166,7 +166,7 @@ Connect to `/ws/hub` with device token authentication.
 {
   "type": "task_status",
   "hubId": "rpi-bridge-01",
-  "timestamp": "2024-01-03T12:00:00Z",
+  "timestamp": "2026-01-03T12:00:00Z",
   "taskId": "cmd-123",
   "status": "completed|failed|running",
   "result": {...},
