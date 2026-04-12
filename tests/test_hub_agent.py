@@ -52,7 +52,7 @@ async def test_hub_agent_initialization(hub_agent):
 @pytest.mark.asyncio
 async def test_connect_to_server(hub_agent, mock_websocket):
     """Test connecting to server."""
-    with patch("websockets.connect", return_value=mock_websocket):
+    with patch("websockets.connect", new=AsyncMock(return_value=mock_websocket)):
         result = await hub_agent.connect_to_server()
 
         assert result is True
@@ -64,7 +64,7 @@ async def test_connect_to_server(hub_agent, mock_websocket):
 @pytest.mark.asyncio
 async def test_connect_handshake_format(hub_agent, mock_websocket):
     """Test connection handshake message format."""
-    with patch("websockets.connect", return_value=mock_websocket):
+    with patch("websockets.connect", new=AsyncMock(return_value=mock_websocket)):
         await hub_agent.connect_to_server()
 
         # Check handshake was sent
@@ -239,7 +239,7 @@ async def test_get_connection_status(hub_agent):
 @pytest.mark.asyncio
 async def test_start_and_stop(hub_agent, mock_websocket):
     """Test starting and stopping hub agent."""
-    with patch("websockets.connect", return_value=mock_websocket):
+    with patch("websockets.connect", new=AsyncMock(return_value=mock_websocket)):
         await hub_agent.start()
         assert hub_agent._running is True
 
@@ -256,10 +256,39 @@ async def test_reconnection_attempt(hub_agent):
     hub_agent._running = True
 
     # Simulate connection failure
-    with patch.object(hub_agent, "connect_to_server", return_value=False) as mock_connect:
-        await hub_agent._handle_reconnection()
+    with patch("asyncio.sleep", new=AsyncMock()):
+        with patch.object(hub_agent, "connect_to_server", return_value=False) as mock_connect:
+            await hub_agent._handle_reconnection()
 
-        assert hub_agent.reconnect_attempts == 1
+            # Reconnection loop should continue until max attempts are exceeded
+            assert hub_agent.reconnect_attempts == hub_agent.max_reconnect_attempts + 1
+            assert mock_connect.call_count == hub_agent.max_reconnect_attempts
+
+
+@pytest.mark.asyncio
+async def test_schedule_reconnection_deduplicates_tasks(hub_agent):
+    """Test reconnect scheduler only creates one active reconnect task."""
+    hub_agent._running = True
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_reconnect():
+        started.set()
+        await release.wait()
+
+    with patch.object(hub_agent, "_handle_reconnection", side_effect=fake_reconnect):
+        hub_agent._schedule_reconnection("first")
+        first_task = hub_agent._reconnect_task
+
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        # Second schedule should be ignored while first task is running
+        hub_agent._schedule_reconnection("second")
+        assert hub_agent._reconnect_task is first_task
+
+        release.set()
+        await asyncio.wait_for(first_task, timeout=1)
 
 
 @pytest.mark.asyncio
@@ -268,11 +297,12 @@ async def test_max_reconnect_attempts(hub_agent):
     hub_agent._running = True
     hub_agent.reconnect_attempts = hub_agent.max_reconnect_attempts
 
-    with patch.object(hub_agent, "connect_to_server", return_value=False):
+    with patch.object(hub_agent, "connect_to_server", return_value=False) as mock_connect:
         await hub_agent._handle_reconnection()
 
         # Should not attempt to reconnect
         assert hub_agent.reconnect_attempts == hub_agent.max_reconnect_attempts + 1
+        assert mock_connect.call_count == 0
 
 
 @pytest.mark.asyncio
@@ -312,23 +342,17 @@ async def test_receive_loop_processes_message(hub_agent, mock_websocket):
     async def command_callback(data):
         nonlocal callback_called
         callback_called = True
+        # Stop loop deterministically after first callback to avoid tight-spin hangs
+        hub_agent._running = False
 
     hub_agent.set_command_callback(command_callback)
     hub_agent.ws_connection = mock_websocket
     hub_agent.is_connected = True
     hub_agent._running = True
 
-    # Start receive loop briefly
+    # Start receive loop and wait for callback-driven shutdown
     receive_task = asyncio.create_task(hub_agent._receive_loop())
-    await asyncio.sleep(0.2)
-
-    hub_agent._running = False
-    receive_task.cancel()
-
-    try:
-        await receive_task
-    except asyncio.CancelledError:
-        pass
+    await asyncio.wait_for(receive_task, timeout=1)
 
     # Callback should have been called
     assert callback_called or mock_websocket.recv.called

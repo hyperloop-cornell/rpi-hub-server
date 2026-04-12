@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import socket
 from datetime import datetime
 from typing import Any, Callable, Dict, Optional
 
@@ -50,6 +51,8 @@ class HubAgent:
         # Tasks
         self._sender_task: Optional[asyncio.Task] = None
         self._receiver_task: Optional[asyncio.Task] = None
+        self._reconnect_task: Optional[asyncio.Task] = None
+        self._connect_lock = asyncio.Lock()
         self._running = False
 
         # Message callbacks
@@ -89,6 +92,13 @@ class HubAgent:
             except asyncio.CancelledError:
                 pass
 
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            try:
+                await self._reconnect_task
+            except asyncio.CancelledError:
+                pass
+
         # Disconnect
         await self.disconnect_from_server()
 
@@ -100,124 +110,166 @@ class HubAgent:
         Returns:
             True if connected successfully
         """
-        try:
-            # Parse endpoint for logging
-            from urllib.parse import urlparse
-            parsed = urlparse(self.server_endpoint)
-            
-            self.logger.info(
-                "ws_connecting",
-                f"Connecting to {self.server_endpoint}",
-                endpoint=self.server_endpoint,
-                scheme=parsed.scheme,
-                host=parsed.hostname,
-                port=parsed.port or (443 if parsed.scheme == "wss" else 80),
-                path=parsed.path,
-            )
-            
-            # Check DNS resolution if not localhost
-            if parsed.hostname and parsed.hostname not in ["localhost", "127.0.0.1"]:
-                try:
-                    import socket
-                    resolved_ip = socket.gethostbyname(parsed.hostname)
-                    self.logger.info(
-                        "dns_resolved",
-                        f"Resolved {parsed.hostname} to {resolved_ip}",
-                        hostname=parsed.hostname,
-                        ip=resolved_ip,
-                    )
-                except socket.gaierror as dns_error:
-                    self.logger.error(
-                        "dns_resolution_failed",
-                        f"Failed to resolve hostname {parsed.hostname}: {dns_error}",
-                        hostname=parsed.hostname,
-                        error=str(dns_error),
-                    )
-                    raise
+        async with self._connect_lock:
+            if self.is_connected and self.ws_connection:
+                return True
 
-            # Connect to WebSocket
-            self.logger.info(
-                "ws_attempting_connection",
-                f"Attempting WebSocket connection with ping_interval=20s, ping_timeout=10s",
-            )
-            
-            self.ws_connection = await websockets.connect(
-                self.server_endpoint,
-                ping_interval=20,
-                ping_timeout=10,
-            )
+            try:
+                # Parse endpoint for logging
+                from urllib.parse import urlparse
+                parsed = urlparse(self.server_endpoint)
+                target_port = parsed.port or (443 if parsed.scheme == "wss" else 80)
 
-            # Send handshake
-            handshake = {
-                "type": "hub_connect",
-                "hubId": self.hub_id,
-                "deviceToken": self.device_token,
-                "timestamp": datetime.now().isoformat(),
-                "version": "1.0.0",
-            }
+                self.logger.info(
+                    "ws_connecting",
+                    f"Connecting to {self.server_endpoint}",
+                    endpoint=self.server_endpoint,
+                    scheme=parsed.scheme,
+                    host=parsed.hostname,
+                    port=target_port,
+                    path=parsed.path,
+                )
 
-            await self.ws_connection.send(json.dumps(handshake))
+                # Check DNS resolution if not localhost. Use getaddrinfo to support dual stack.
+                if parsed.hostname and parsed.hostname not in ["localhost", "127.0.0.1"]:
+                    try:
+                        addr_info = socket.getaddrinfo(
+                            parsed.hostname,
+                            target_port,
+                            type=socket.SOCK_STREAM,
+                        )
+                        resolved_ips = sorted({info[4][0] for info in addr_info if info and len(info) > 4})
 
-            self.is_connected = True
-            self.reconnect_attempts = 0
+                        self.logger.info(
+                            "dns_resolved",
+                            f"Resolved {parsed.hostname} to {resolved_ips}",
+                            hostname=parsed.hostname,
+                            ip_count=len(resolved_ips),
+                            ips=resolved_ips,
+                        )
+                    except socket.gaierror as dns_error:
+                        self.logger.error(
+                            "dns_resolution_failed",
+                            f"Failed to resolve hostname {parsed.hostname}: {dns_error}",
+                            hostname=parsed.hostname,
+                            error=str(dns_error),
+                        )
+                        raise
 
-            # Start sender and receiver tasks
-            self._sender_task = asyncio.create_task(self._send_loop())
-            self._receiver_task = asyncio.create_task(self._receive_loop())
+                # Connect to WebSocket
+                self.logger.info(
+                    "ws_attempting_connection",
+                    "Attempting WebSocket connection with ping_interval=20s, ping_timeout=10s, open_timeout=15s",
+                )
 
-            self.logger.info(
-                "Sender and receiver tasks created",
-                extra={
-                    "event": "tasks_created",
-                    "sender_task_done": self._sender_task.done(),
-                    "receiver_task_done": self._receiver_task.done(),
+                self.ws_connection = await websockets.connect(
+                    self.server_endpoint,
+                    ping_interval=20,
+                    ping_timeout=10,
+                    open_timeout=15,
+                )
+
+                # Send handshake
+                handshake = {
+                    "type": "hub_connect",
+                    "hubId": self.hub_id,
+                    "deviceToken": self.device_token,
+                    "timestamp": datetime.now().isoformat(),
+                    "version": "1.0.0",
                 }
-            )
 
+                await self.ws_connection.send(json.dumps(handshake))
+
+                self.is_connected = True
+                self.reconnect_attempts = 0
+
+                # Start sender and receiver tasks
+                self._sender_task = asyncio.create_task(self._send_loop())
+                self._receiver_task = asyncio.create_task(self._receive_loop())
+
+                self.logger.info(
+                    "Sender and receiver tasks created",
+                    extra={
+                        "event": "tasks_created",
+                        "sender_task_done": self._sender_task.done(),
+                        "receiver_task_done": self._receiver_task.done(),
+                    }
+                )
+
+                self.logger.info(
+                    "ws_connected",
+                    "Connected to server",
+                    endpoint=self.server_endpoint,
+                )
+
+                return True
+
+            except Exception as e:
+                self.is_connected = False
+
+                if self.ws_connection:
+                    try:
+                        await self.ws_connection.close()
+                    except Exception:
+                        pass
+                    finally:
+                        self.ws_connection = None
+
+                # Extract more details for common error types
+                error_details = {
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "endpoint": self.server_endpoint,
+                }
+
+                # Add errno for OSError/ConnectionRefusedError
+                if hasattr(e, "errno"):
+                    error_details["errno"] = e.errno
+
+                # Add specific messages for common errors
+                error_msg = f"Error connecting to server: {e}"
+                if "Connection refused" in str(e) or (hasattr(e, "errno") and e.errno == 111):
+                    error_msg += " - The server is not accepting connections. Check if the cloud service is running and accessible from this device."
+                elif "Name or service not known" in str(e) or "getaddrinfo failed" in str(e):
+                    error_msg += " - DNS resolution failed. Check the hostname in SERVER_ENDPOINT."
+                elif "Network is unreachable" in str(e):
+                    error_msg += " - Network unreachable. Check your network connection."
+                elif "timed out" in str(e).lower():
+                    error_msg += " - Connection timed out. Check if the server is accessible and not blocked by firewall."
+
+                self.logger.error(
+                    "ws_connection_error",
+                    error_msg,
+                    **error_details,
+                )
+
+                # Schedule reconnection
+                if self._running:
+                    self._schedule_reconnection("connect_failure")
+
+                return False
+
+    def _schedule_reconnection(self, reason: str) -> None:
+        """Schedule reconnection if one is not already in progress."""
+        if not self._running:
+            return
+
+        if self._reconnect_task and not self._reconnect_task.done():
             self.logger.info(
-                "ws_connected",
-                "Connected to server",
-                endpoint=self.server_endpoint,
+                "ws_reconnect_already_scheduled",
+                "Reconnect task already running",
+                reason=reason,
+                attempt=self.reconnect_attempts,
             )
+            return
 
-            return True
-
-        except Exception as e:
-            self.is_connected = False
-            
-            # Extract more details for common error types
-            error_details = {
-                "error": str(e),
-                "error_type": type(e).__name__,
-                "endpoint": self.server_endpoint,
-            }
-            
-            # Add errno for OSError/ConnectionRefusedError
-            if hasattr(e, 'errno'):
-                error_details["errno"] = e.errno
-                
-            # Add specific messages for common errors
-            error_msg = f"Error connecting to server: {e}"
-            if "Connection refused" in str(e) or (hasattr(e, 'errno') and e.errno == 111):
-                error_msg += " - The server is not accepting connections. Check if the cloud service is running and accessible from this device."
-            elif "Name or service not known" in str(e) or "getaddrinfo failed" in str(e):
-                error_msg += " - DNS resolution failed. Check the hostname in SERVER_ENDPOINT."
-            elif "Network is unreachable" in str(e):
-                error_msg += " - Network unreachable. Check your network connection."
-            elif "timed out" in str(e).lower():
-                error_msg += " - Connection timed out. Check if the server is accessible and not blocked by firewall."
-            
-            self.logger.error(
-                "ws_connection_error",
-                error_msg,
-                **error_details,
-            )
-
-            # Schedule reconnection
-            if self._running:
-                asyncio.create_task(self._handle_reconnection())
-
-            return False
+        self._reconnect_task = asyncio.create_task(self._handle_reconnection())
+        self.logger.info(
+            "ws_reconnect_scheduled",
+            "Reconnect task scheduled",
+            reason=reason,
+            attempt=self.reconnect_attempts,
+        )
 
     async def disconnect_from_server(self) -> None:
         """Disconnect from WebSocket server."""
@@ -237,31 +289,42 @@ class HubAgent:
 
     async def _handle_reconnection(self) -> None:
         """Handle reconnection with exponential backoff."""
-        if not self._running:
-            return
+        try:
+            while self._running and not self.is_connected:
+                self.reconnect_attempts += 1
 
-        self.reconnect_attempts += 1
+                if (
+                    self.max_reconnect_attempts > 0
+                    and self.reconnect_attempts > self.max_reconnect_attempts
+                ):
+                    self.logger.error(
+                        "max_reconnect_attempts_reached",
+                        "Maximum reconnection attempts reached",
+                        attempts=self.reconnect_attempts,
+                    )
+                    return
 
-        if self.reconnect_attempts > self.max_reconnect_attempts:
-            self.logger.error(
-                "max_reconnect_attempts_reached",
-                "Maximum reconnection attempts reached",
-                attempts=self.reconnect_attempts,
-            )
-            return
+                # Exponential backoff (up to 60s)
+                delay = min(self.reconnect_interval * (2 ** (self.reconnect_attempts - 1)), 60)
 
-        # Exponential backoff (up to 60s)
-        delay = min(self.reconnect_interval * (2 ** (self.reconnect_attempts - 1)), 60)
+                self.logger.info(
+                    "ws_reconnecting",
+                    f"Reconnecting in {delay}s (attempt {self.reconnect_attempts})",
+                    delay_s=delay,
+                    attempt=self.reconnect_attempts,
+                )
 
-        self.logger.info(
-            "ws_reconnecting",
-            f"Reconnecting in {delay}s (attempt {self.reconnect_attempts})",
-            delay_s=delay,
-            attempt=self.reconnect_attempts,
-        )
+                await asyncio.sleep(delay)
 
-        await asyncio.sleep(delay)
-        await self.connect_to_server()
+                if not self._running or self.is_connected:
+                    return
+
+                connected = await self.connect_to_server()
+                if connected:
+                    return
+        finally:
+            if asyncio.current_task() is self._reconnect_task:
+                self._reconnect_task = None
 
     async def _send_loop(self) -> None:
         """Send buffered messages to server."""
@@ -307,9 +370,13 @@ class HubAgent:
                         )
                     else:
                         self.logger.warning(
+                            "ws_connection_lost",
                             "WebSocket connection lost, cannot send message",
-                            extra={"event": "ws_connection_lost", "message_type": message.message_type}
+                            message_type=message.message_type,
                         )
+                        self.is_connected = False
+                        self._schedule_reconnection("missing_ws_in_send")
+                        break
                 else:
                     # No messages, wait a bit
                     await asyncio.sleep(0.1)
@@ -321,7 +388,19 @@ class HubAgent:
                 )
                 self.is_connected = False
                 if self._running:
-                    asyncio.create_task(self._handle_reconnection())
+                    self._schedule_reconnection("send_connection_closed")
+                break
+
+            except (WebSocketException, OSError) as e:
+                self.logger.warning(
+                    "ws_send_transport_error",
+                    f"Transport error during send: {e}",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+                self.is_connected = False
+                if self._running:
+                    self._schedule_reconnection("send_transport_error")
                 break
 
             except asyncio.CancelledError:
@@ -354,6 +433,9 @@ class HubAgent:
         while self._running and self.is_connected:
             try:
                 if not self.ws_connection:
+                    self.is_connected = False
+                    if self._running:
+                        self._schedule_reconnection("missing_ws_in_receive")
                     break
 
                 # Receive message
@@ -377,7 +459,19 @@ class HubAgent:
                 )
                 self.is_connected = False
                 if self._running:
-                    asyncio.create_task(self._handle_reconnection())
+                    self._schedule_reconnection("receive_connection_closed")
+                break
+
+            except (WebSocketException, OSError) as e:
+                self.logger.warning(
+                    "ws_receive_transport_error",
+                    f"Transport error during receive: {e}",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+                self.is_connected = False
+                if self._running:
+                    self._schedule_reconnection("receive_transport_error")
                 break
 
             except asyncio.CancelledError:
