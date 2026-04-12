@@ -119,6 +119,8 @@ class HubAgent:
                 from urllib.parse import urlparse
                 parsed = urlparse(self.server_endpoint)
                 target_port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+                has_ipv4 = False
+                has_ipv6 = False
 
                 self.logger.info(
                     "ws_connecting",
@@ -139,6 +141,12 @@ class HubAgent:
                             type=socket.SOCK_STREAM,
                         )
                         resolved_ips = sorted({info[4][0] for info in addr_info if info and len(info) > 4})
+                        has_ipv4 = any(
+                            info[0] == socket.AF_INET for info in addr_info
+                        )
+                        has_ipv6 = any(
+                            info[0] == socket.AF_INET6 for info in addr_info
+                        )
 
                         self.logger.info(
                             "dns_resolved",
@@ -146,6 +154,8 @@ class HubAgent:
                             hostname=parsed.hostname,
                             ip_count=len(resolved_ips),
                             ips=resolved_ips,
+                            has_ipv4=has_ipv4,
+                            has_ipv6=has_ipv6,
                         )
                     except socket.gaierror as dns_error:
                         self.logger.error(
@@ -162,12 +172,46 @@ class HubAgent:
                     "Attempting WebSocket connection with ping_interval=20s, ping_timeout=10s, open_timeout=15s",
                 )
 
-                self.ws_connection = await websockets.connect(
-                    self.server_endpoint,
-                    ping_interval=20,
-                    ping_timeout=10,
-                    open_timeout=15,
-                )
+                connect_kwargs: Dict[str, Any] = {
+                    "ping_interval": 20,
+                    "ping_timeout": 10,
+                    "open_timeout": 15,
+                }
+
+                if has_ipv4 and has_ipv6:
+                    # Prefer quick dual-stack fallback instead of waiting on a dead family.
+                    connect_kwargs["happy_eyeballs_delay"] = 0.25
+                    connect_kwargs["interleave"] = 1
+
+                try:
+                    self.ws_connection = await websockets.connect(
+                        self.server_endpoint,
+                        **connect_kwargs,
+                    )
+                except TimeoutError:
+                    if has_ipv4 and has_ipv6:
+                        self.logger.warning(
+                            "ws_connect_timeout_dual_stack",
+                            "Dual-stack connect timed out, retrying with forced IPv4",
+                            endpoint=self.server_endpoint,
+                        )
+                        ipv4_connect_kwargs = dict(connect_kwargs)
+                        ipv4_connect_kwargs.pop("happy_eyeballs_delay", None)
+                        ipv4_connect_kwargs.pop("interleave", None)
+                        ipv4_connect_kwargs["family"] = socket.AF_INET
+
+                        self.ws_connection = await websockets.connect(
+                            self.server_endpoint,
+                            **ipv4_connect_kwargs,
+                        )
+
+                        self.logger.info(
+                            "ws_connected_ipv4_fallback",
+                            "Connected using forced IPv4 fallback",
+                            endpoint=self.server_endpoint,
+                        )
+                    else:
+                        raise
 
                 # Send handshake
                 handshake = {
@@ -216,8 +260,9 @@ class HubAgent:
                         self.ws_connection = None
 
                 # Extract more details for common error types
+                error_text = str(e).strip() or type(e).__name__
                 error_details = {
-                    "error": str(e),
+                    "error": error_text,
                     "error_type": type(e).__name__,
                     "endpoint": self.server_endpoint,
                 }
@@ -227,14 +272,15 @@ class HubAgent:
                     error_details["errno"] = e.errno
 
                 # Add specific messages for common errors
-                error_msg = f"Error connecting to server: {e}"
+                error_msg = f"Error connecting to server: {error_text}"
                 if "Connection refused" in str(e) or (hasattr(e, "errno") and e.errno == 111):
                     error_msg += " - The server is not accepting connections. Check if the cloud service is running and accessible from this device."
                 elif "Name or service not known" in str(e) or "getaddrinfo failed" in str(e):
                     error_msg += " - DNS resolution failed. Check the hostname in SERVER_ENDPOINT."
                 elif "Network is unreachable" in str(e):
                     error_msg += " - Network unreachable. Check your network connection."
-                elif "timed out" in str(e).lower():
+                elif isinstance(e, TimeoutError) or "timed out" in str(e).lower():
+                    error_details["timeout_s"] = 15
                     error_msg += " - Connection timed out. Check if the server is accessible and not blocked by firewall."
 
                 self.logger.error(
