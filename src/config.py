@@ -65,9 +65,10 @@ class BenchConfig(BaseModel):
 
     source: Literal["usb", "sim"] = Field(default="usb", description="usb = real devices, sim = simulated")
     auto_connect: Literal["known_boards", "all", "none"] = Field(
-        default="all",
+        default="known_boards",
         description="known_boards = only devices in the board registry; all = every USB serial device",
     )
+    boards_file: str = Field(default="config/boards.yaml", description="Board registry (VID/PID -> board)")
     sim_devices: List[Dict[str, Any]] = Field(default_factory=list, description="Simulated devices (source: sim)")
     sim_speedup: float = Field(default=1.0, description="Speeds up simulated restarts/flashes (tests)")
 

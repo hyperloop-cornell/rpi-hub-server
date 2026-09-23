@@ -41,7 +41,8 @@ def test_repo_config_defaults(monkeypatch):
     assert settings.hub.profile_name == ""
     assert settings.api.host == "127.0.0.1"
     assert settings.bench.source == "usb"
-    assert settings.auto_connect_policy == "all"
+    assert settings.auto_connect_policy == "known_boards"
+    assert settings.bench.boards_file == "config/boards.yaml"
     assert settings.hub.max_reconnect_attempts == 0
 
 

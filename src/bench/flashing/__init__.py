@@ -2,6 +2,7 @@
 
 from .arduino_cli import ArduinoCliFlasher
 from .formats import FirmwareFormatError, detect_format
+from .openocd import OpenOcdFlasher
 from .tools import ToolError
 
-__all__ = ["ArduinoCliFlasher", "FirmwareFormatError", "ToolError", "detect_format"]
+__all__ = ["ArduinoCliFlasher", "FirmwareFormatError", "OpenOcdFlasher", "ToolError", "detect_format"]

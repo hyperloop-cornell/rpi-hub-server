@@ -14,6 +14,7 @@ from src.bench.backend import (
     FlashRequest,
     new_session_id,
 )
+from src.bench.boards import BoardRegistry
 from src.bench.flashing import FirmwareFormatError, detect_format
 from src.logging_config import StructuredLogger
 
@@ -76,14 +77,16 @@ class SimBenchBackend(BenchBackend):
         self,
         hub_id: str,
         specs: Optional[List[SimDeviceSpec]] = None,
-        board_resolver=None,
+        registry: Optional[BoardRegistry] = None,
         speedup: float = 1.0,
     ):
         super().__init__()
         self.logger = StructuredLogger(__name__)
         self.hub_id = hub_id
-        self.specs = specs or list(DEFAULT_SIM_DEVICES)
-        self.board_resolver = board_resolver
+        self.specs = specs if specs is not None else list(DEFAULT_SIM_DEVICES)
+        self.registry = registry
+        if registry is not None and registry.artifact_formats():
+            self.flash_formats = registry.artifact_formats()
         self.speedup = max(speedup, 0.001)
         self._devices: Dict[str, BenchDevice] = {}
         self._specs_by_port: Dict[str, SimDeviceSpec] = {}
@@ -110,8 +113,8 @@ class SimBenchBackend(BenchBackend):
             location=f"sim-{index}",
             detected_baud=spec.baud,
         )
-        if self.board_resolver:
-            device.board = self.board_resolver(device)
+        if self.registry is not None:
+            device.board = self.registry.get(spec.board) or self.registry.match_device(device)
         return device
 
     async def start(self) -> None:
@@ -210,7 +213,13 @@ class SimBenchBackend(BenchBackend):
             raise BenchError(str(e)) from e
 
         board = device.board
-        if board is not None and artifact_format not in getattr(board, "artifacts", [artifact_format]):
+        if request.board_profile and self.registry is not None:
+            board = self.registry.get(request.board_profile)
+            if board is None:
+                raise BenchError(f"Unknown board profile: {request.board_profile}")
+        if board is not None and board.flasher == "none":
+            raise BenchError(f"{board.name} cannot be flashed in its current mode")
+        if board is not None and board.artifacts and artifact_format not in board.artifacts:
             raise BenchError(f"{board.name} does not accept .{artifact_format} firmware")
         if artifact_format == "ino" and not (request.board_fqbn or getattr(board, "fqbn", None)):
             raise BenchError("Board FQBN is required for compiling .ino source files")
@@ -224,6 +233,7 @@ class SimBenchBackend(BenchBackend):
             "port_id": port_id,
             "artifact_format": artifact_format,
             "board_fqbn": request.board_fqbn or getattr(board, "fqbn", None),
+            "board_profile": board.id if board else None,
             "flash_duration_ms": int((time.monotonic() - started) * 1000),
             "output": "Simulated flash complete",
         }

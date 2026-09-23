@@ -3,15 +3,20 @@
 import asyncio
 import base64
 import json
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
 
+from src.bench.boards import BoardRegistry
 from src.config import Settings
 from src.runtime import HubRuntime
 from src.sim import SimBenchBackend, SimDeviceSpec
 from src.uplink import hub_agent as hub_agent_module
+
+
+REGISTRY = BoardRegistry.load(Path(__file__).parent.parent / "config" / "boards.yaml")
 
 
 @pytest.fixture(autouse=True)
@@ -39,8 +44,12 @@ def settings_for(cloud_url, tmp_path, **bench):
 async def runtime(fake_cloud, tmp_path):
     backend = SimBenchBackend(
         hub_id="rpi-bridge-01",
-        specs=[SimDeviceSpec(name="uno", interval_ms=20, flash_seconds=0.1), SimDeviceSpec(name="mega", interval_ms=20)],
+        specs=[
+            SimDeviceSpec(name="uno", interval_ms=20, flash_seconds=0.1),
+            SimDeviceSpec(name="mega", interval_ms=20, product_id="0042"),
+        ],
         speedup=50,
+        registry=REGISTRY,
     )
     rt = HubRuntime(settings_for(fake_cloud.url, tmp_path), backend=backend)
     await rt.start()
@@ -63,6 +72,8 @@ async def test_devices_announced_and_telemetry_flows(fake_cloud, runtime):
     info = events[0]["deviceInfo"]
     assert info["session_id"].startswith("session-")
     assert info["vendor_id"] == "2341"
+    boards = {e["deviceInfo"]["board_profile"]["id"] for e in events}
+    assert boards == {"uno_r3", "mega2560"}
 
     telemetry = await fake_cloud.wait_for(lambda c: c.of_type("telemetry"))
     assert b"TEMP:" in base64.b64decode(telemetry[0]["data"])
@@ -131,13 +142,16 @@ async def test_lost_connection_reopened(fake_cloud, runtime):
 
 @pytest.mark.asyncio
 async def test_known_boards_policy_skips_unknown(fake_cloud, tmp_path):
-    backend = SimBenchBackend(hub_id="h", specs=[SimDeviceSpec(name="unknown")], speedup=50)
+    modem = SimDeviceSpec(name="modem", vendor_id="1e0e", product_id="9001", product="SIMCom modem")
+    uno = SimDeviceSpec(name="uno")
+    backend = SimBenchBackend(hub_id="h", specs=[modem, uno], speedup=50, registry=REGISTRY)
     rt = HubRuntime(settings_for(fake_cloud.url, tmp_path, auto_connect="known_boards"), backend=backend)
     await rt.start()
     try:
         await asyncio.sleep(0.2)
-        assert backend.connections() == []
-        assert len(backend.devices()) == 1
+        opened = {backend.get_device(c.port_id).product for c in backend.connections()}
+        assert opened == {"Arduino Uno"}
+        assert len(backend.devices()) == 2
     finally:
         await rt.stop()
 
