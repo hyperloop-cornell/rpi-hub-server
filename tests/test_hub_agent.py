@@ -1,350 +1,180 @@
-"""Test Hub Agent."""
+"""HubAgent against a local WebSocket server: handshake, buffering, reconnects."""
 
 import asyncio
-import json
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
-from src.buffer_manager import BufferManager
-from src.hub_agent import HubAgent
+from tests.conftest import FakeCloud
+from src.uplink import hub_agent as hub_agent_module
+from src.uplink.buffer_manager import BufferManager
+from src.uplink.hub_agent import HubAgent
 
 
-@pytest.fixture
-def buffer_manager():
-    """Create buffer manager instance."""
-    return BufferManager(size_mb=1.0, warn_threshold=0.8)
+@pytest.fixture(autouse=True)
+def fast_reconnect(monkeypatch):
+    monkeypatch.setattr(hub_agent_module, "MIN_RECONNECT_DELAY_SECONDS", 0.05)
+    monkeypatch.setattr(hub_agent_module.random, "uniform", lambda a, b: 1.0)
 
 
-@pytest.fixture
-def hub_agent(buffer_manager):
-    """Create hub agent instance."""
-    return HubAgent(
-        hub_id="test_hub",
-        server_endpoint="ws://localhost:8080/hub",
-        device_token="test_token",
-        buffer_manager=buffer_manager,
-        reconnect_interval=1,
-        max_reconnect_attempts=3,
+def make_agent(url, **kwargs):
+    defaults = dict(
+        hub_id="rpi-bridge-01",
+        server_endpoint=url,
+        device_token="token-1",
+        buffer_manager=BufferManager(size_mb=1),
+        reconnect_interval=0.05,
     )
-
-
-@pytest.fixture
-def mock_websocket():
-    """Create mock WebSocket connection."""
-    ws = AsyncMock()
-    ws.send = AsyncMock()
-    ws.recv = AsyncMock()
-    ws.close = AsyncMock()
-    return ws
+    defaults.update(kwargs)
+    return HubAgent(**defaults)
 
 
 @pytest.mark.asyncio
-async def test_hub_agent_initialization(hub_agent):
-    """Test hub agent initialization."""
-    assert hub_agent.hub_id == "test_hub"
-    assert hub_agent.server_endpoint == "ws://localhost:8080/hub"
-    assert hub_agent.device_token == "test_token"
-    assert hub_agent.is_connected is False
-    assert hub_agent.reconnect_attempts == 0
-
-
-@pytest.mark.asyncio
-async def test_connect_to_server(hub_agent, mock_websocket):
-    """Test connecting to server."""
-    with patch("websockets.connect", return_value=mock_websocket):
-        result = await hub_agent.connect_to_server()
-
-        assert result is True
-        assert hub_agent.is_connected is True
-        assert hub_agent.ws_connection == mock_websocket
-        assert mock_websocket.send.called
-
-
-@pytest.mark.asyncio
-async def test_connect_handshake_format(hub_agent, mock_websocket):
-    """Test connection handshake message format."""
-    with patch("websockets.connect", return_value=mock_websocket):
-        await hub_agent.connect_to_server()
-
-        # Check handshake was sent
-        call_args = mock_websocket.send.call_args[0][0]
-        handshake = json.loads(call_args)
-
+async def test_handshake_includes_capabilities_and_profile(fake_cloud):
+    agent = make_agent(
+        fake_cloud.url,
+        capabilities=["bench", "flash:ino", "device_snapshot"],
+        profile=lambda: {"name": "lab-hub", "mode": "bench", "uplink": "wifi"},
+    )
+    await agent.start()
+    try:
+        await asyncio.wait_for(fake_cloud.connected.wait(), 5)
+        handshake = fake_cloud.handshakes[0]
         assert handshake["type"] == "hub_connect"
-        assert handshake["hubId"] == "test_hub"
-        assert handshake["deviceToken"] == "test_token"
-        assert "timestamp" in handshake
-        assert "version" in handshake
+        assert handshake["hubId"] == "rpi-bridge-01"
+        assert handshake["deviceToken"] == "token-1"
+        assert handshake["capabilities"] == ["bench", "flash:ino", "device_snapshot"]
+        assert handshake["profile"] == {"name": "lab-hub", "mode": "bench", "uplink": "wifi"}
+        assert handshake["timestamp"].endswith("Z")
+        await fake_cloud.wait_for(lambda c: agent.is_connected)
+    finally:
+        await agent.stop()
 
 
 @pytest.mark.asyncio
-async def test_connect_failure(hub_agent):
-    """Test connection failure handling."""
-    with patch("websockets.connect", side_effect=Exception("Connection failed")):
-        result = await hub_agent.connect_to_server()
-
-        assert result is False
-        assert hub_agent.is_connected is False
-
-
-@pytest.mark.asyncio
-async def test_disconnect_from_server(hub_agent, mock_websocket):
-    """Test disconnecting from server."""
-    hub_agent.ws_connection = mock_websocket
-    hub_agent.is_connected = True
-
-    await hub_agent.disconnect_from_server()
-
-    assert hub_agent.is_connected is False
-    assert hub_agent.ws_connection is None
-    assert mock_websocket.close.called
-
-
-@pytest.mark.asyncio
-async def test_send_telemetry(hub_agent, buffer_manager):
-    """Test sending telemetry data."""
-    await hub_agent.send_telemetry(
-        port_id="port_0",
-        session_id="session_123",
-        data=b"test data",
-    )
-
-    # Should be in buffer
-    assert buffer_manager.get_message_count() > 0
-
-    # Check message format
-    messages = await buffer_manager.get_messages()
-    assert messages[0].message_type == "telemetry"
-    assert "portId" in messages[0].payload
-    assert "sessionId" in messages[0].payload
-    assert "data" in messages[0].payload  # Base64 encoded
-
-
-@pytest.mark.asyncio
-async def test_send_health_status(hub_agent, buffer_manager):
-    """Test sending health status."""
-    health_data = {
-        "cpuUsage": 45.2,
-        "memoryUsage": 62.1,
-        "uptimeSeconds": 3600,
-    }
-
-    await hub_agent.send_health_status(health_data)
-
-    assert buffer_manager.get_message_count() > 0
-
-    messages = await buffer_manager.get_messages()
-    assert messages[0].message_type == "health"
-    assert messages[0].payload["cpuUsage"] == 45.2
-
-
-@pytest.mark.asyncio
-async def test_send_device_event(hub_agent, buffer_manager):
-    """Test sending device event."""
-    device_info = {
-        "vendor_id": "2341",
-        "product_id": "0043",
-    }
-
-    await hub_agent.send_device_event(
-        event_type="connected",
-        port_id="port_0",
-        device_info=device_info,
-    )
-
-    assert buffer_manager.get_message_count() > 0
-
-    messages = await buffer_manager.get_messages()
-    assert messages[0].message_type == "device_event"
-    assert messages[0].payload["eventType"] == "connected"
-    assert messages[0].payload["portId"] == "port_0"
-
-
-@pytest.mark.asyncio
-async def test_send_task_status(hub_agent, buffer_manager):
-    """Test sending task status."""
-    await hub_agent.send_task_status(
-        task_id="task_123",
-        status="completed",
-        progress=100,
-        result={"success": True},
-    )
-
-    assert buffer_manager.get_message_count() > 0
-
-    messages = await buffer_manager.get_messages()
-    assert messages[0].message_type == "task_status"
-    assert messages[0].payload["taskId"] == "task_123"
-    assert messages[0].payload["status"] == "completed"
-    assert messages[0].payload["progress"] == 100
-
-
-@pytest.mark.asyncio
-async def test_command_callback(hub_agent):
-    """Test command callback invocation."""
-    callback_data = []
-
-    async def command_callback(data):
-        callback_data.append(data)
-
-    hub_agent.set_command_callback(command_callback)
-
-    # Simulate incoming command
-    command = {"type": "command", "commandId": "cmd_123"}
-    await hub_agent._process_incoming_message(command)
-
-    assert len(callback_data) == 1
-    assert callback_data[0]["commandId"] == "cmd_123"
-
-
-@pytest.mark.asyncio
-async def test_device_event_callback(hub_agent):
-    """Test device event callback invocation."""
-    callback_data = []
-
-    def device_event_callback(data):
-        callback_data.append(data)
-
-    hub_agent.set_device_event_callback(device_event_callback)
-
-    # Simulate incoming device event
-    event = {"type": "device_event", "eventType": "connected"}
-    await hub_agent._process_incoming_message(event)
-
-    assert len(callback_data) == 1
-    assert callback_data[0]["eventType"] == "connected"
-
-
-@pytest.mark.asyncio
-async def test_unknown_message_type(hub_agent):
-    """Test handling unknown message type."""
-    # Should log warning but not crash
-    unknown_msg = {"type": "unknown_type", "data": "test"}
-    await hub_agent._process_incoming_message(unknown_msg)
-
-
-@pytest.mark.asyncio
-async def test_get_connection_status(hub_agent):
-    """Test getting connection status."""
-    status = hub_agent.get_connection_status()
-
-    assert "is_connected" in status
-    assert "server_endpoint" in status
-    assert "reconnect_attempts" in status
-    assert "buffer_stats" in status
-    assert status["is_connected"] is False
-
-
-@pytest.mark.asyncio
-async def test_start_and_stop(hub_agent, mock_websocket):
-    """Test starting and stopping hub agent."""
-    with patch("websockets.connect", return_value=mock_websocket):
-        await hub_agent.start()
-        assert hub_agent._running is True
-
-        # Give tasks time to start
-        await asyncio.sleep(0.1)
-
-        await hub_agent.stop()
-        assert hub_agent._running is False
-
-
-@pytest.mark.asyncio
-async def test_reconnection_attempt(hub_agent):
-    """Test reconnection logic."""
-    hub_agent._running = True
-
-    # Simulate connection failure
-    with patch.object(hub_agent, "connect_to_server", return_value=False) as mock_connect:
-        await hub_agent._handle_reconnection()
-
-        assert hub_agent.reconnect_attempts == 1
-
-
-@pytest.mark.asyncio
-async def test_max_reconnect_attempts(hub_agent):
-    """Test max reconnection attempts limit."""
-    hub_agent._running = True
-    hub_agent.reconnect_attempts = hub_agent.max_reconnect_attempts
-
-    with patch.object(hub_agent, "connect_to_server", return_value=False):
-        await hub_agent._handle_reconnection()
-
-        # Should not attempt to reconnect
-        assert hub_agent.reconnect_attempts == hub_agent.max_reconnect_attempts + 1
-
-
-@pytest.mark.asyncio
-async def test_send_loop_integration(hub_agent, mock_websocket, buffer_manager):
-    """Test send loop processes buffer."""
-    # Add message to buffer
-    buffer_manager.add_message("test", {"data": "value"})
-
-    hub_agent.ws_connection = mock_websocket
-    hub_agent.is_connected = True
-    hub_agent._running = True
-
-    # Start send loop briefly
-    send_task = asyncio.create_task(hub_agent._send_loop())
-    await asyncio.sleep(0.2)
-
-    hub_agent._running = False
-    send_task.cancel()
-
+async def test_messages_sent_with_envelope(fake_cloud):
+    agent = make_agent(fake_cloud.url)
+    await agent.start()
     try:
-        await send_task
-    except asyncio.CancelledError:
-        pass
+        await asyncio.wait_for(fake_cloud.connected.wait(), 5)
+        agent.queue_telemetry("port-1", "s1", b"TEMP: 21\n")
+        agent.send_task_status_update({"task_id": "t1", "status": "completed", "command_type": "restart", "port_id": "port-1"})
+        await fake_cloud.wait_for(lambda c: c.of_type("task_status"))
 
-    # Should have sent message
-    assert mock_websocket.send.called
+        telemetry = fake_cloud.of_type("telemetry")[0]
+        assert telemetry["hubId"] == "rpi-bridge-01"
+        assert telemetry["portId"] == "port-1"
+        assert telemetry["data"] == "VEVNUDogMjEK"
+        assert telemetry["timestamp"].endswith("Z")
+
+        task = fake_cloud.of_type("task_status")[0]
+        assert task == {**task, "taskId": "t1", "status": "completed", "commandType": "restart", "portId": "port-1"}
+    finally:
+        await agent.stop()
 
 
 @pytest.mark.asyncio
-async def test_receive_loop_processes_message(hub_agent, mock_websocket):
-    """Test receive loop processes incoming messages."""
-    command = {"type": "command", "commandId": "cmd_456"}
-    mock_websocket.recv.return_value = json.dumps(command)
+async def test_buffers_while_disconnected_and_drains_after_connect():
+    cloud = FakeCloud()
+    await cloud.start()
+    port = cloud.port
+    await cloud.stop()  # nothing listening yet
 
-    callback_called = False
-
-    async def command_callback(data):
-        nonlocal callback_called
-        callback_called = True
-
-    hub_agent.set_command_callback(command_callback)
-    hub_agent.ws_connection = mock_websocket
-    hub_agent.is_connected = True
-    hub_agent._running = True
-
-    # Start receive loop briefly
-    receive_task = asyncio.create_task(hub_agent._receive_loop())
-    await asyncio.sleep(0.2)
-
-    hub_agent._running = False
-    receive_task.cancel()
-
+    agent = make_agent(f"ws://127.0.0.1:{port}/hub")
+    await agent.start()
     try:
-        await receive_task
-    except asyncio.CancelledError:
-        pass
+        agent.queue_telemetry("port-1", "s1", b"early\n")
+        for _ in range(200):  # refused connects can take ~2s on Windows
+            if agent.reconnect_attempts >= 1:
+                break
+            await asyncio.sleep(0.05)
+        assert not agent.is_connected
+        assert agent.reconnect_attempts >= 1
 
-    # Callback should have been called
-    assert callback_called or mock_websocket.recv.called
+        cloud = FakeCloud()
+        cloud.server = await __import__("websockets").serve(cloud._handler, "127.0.0.1", port)
+        cloud.port = port
+        await cloud.wait_for(lambda c: c.of_type("telemetry"), timeout=10)
+        assert cloud.of_type("telemetry")[0]["data"] == "ZWFybHkK"
+    finally:
+        await agent.stop()
+        await cloud.stop()
 
 
 @pytest.mark.asyncio
-async def test_telemetry_base64_encoding(hub_agent, buffer_manager):
-    """Test telemetry data is base64 encoded."""
-    import base64
+async def test_reconnects_after_server_drop(fake_cloud):
+    connects = []
 
-    test_data = b"Arduino serial data"
-    await hub_agent.send_telemetry("port_0", "session_123", test_data)
+    async def on_connect():
+        connects.append(True)
 
-    messages = await buffer_manager.get_messages()
-    encoded_data = messages[0].payload["data"]
+    agent = make_agent(fake_cloud.url)
+    agent.add_connected_callback(on_connect)
+    await agent.start()
+    try:
+        await fake_cloud.wait_for(lambda c: len(c.handshakes) == 1)
+        await fake_cloud.drop_connections()
+        await fake_cloud.wait_for(lambda c: len(c.handshakes) == 2, timeout=10)
+        await fake_cloud.wait_for(lambda c: agent.is_connected)
+        assert len(connects) == 2
+    finally:
+        await agent.stop()
 
-    # Decode and verify
-    decoded = base64.b64decode(encoded_data)
-    assert decoded == test_data
+
+@pytest.mark.asyncio
+async def test_rejected_hub_backs_off():
+    cloud = FakeCloud(reject_with=1008)
+    await cloud.start()
+    agent = make_agent(cloud.url)
+    await agent.start()
+    try:
+        await cloud.wait_for(lambda c: len(c.handshakes) >= 2, timeout=10)
+        assert "Rejected by server" in (agent.last_error or "")
+        # Short-lived connections count as failures, so the delay grows
+        assert agent.reconnect_attempts >= 1
+    finally:
+        await agent.stop()
+        await cloud.stop()
+
+
+@pytest.mark.asyncio
+async def test_max_reconnect_attempts_stops(monkeypatch):
+    cloud = FakeCloud()
+    await cloud.start()
+    port = cloud.port
+    await cloud.stop()
+
+    agent = make_agent(f"ws://127.0.0.1:{port}/hub", max_reconnect_attempts=2)
+    await agent.start()
+    try:
+        for _ in range(100):
+            if not agent._running:
+                break
+            await asyncio.sleep(0.05)
+        assert agent._running is False
+        assert agent.reconnect_attempts == 2
+    finally:
+        await agent.stop()
+
+
+@pytest.mark.asyncio
+async def test_commands_routed_to_callback(fake_cloud):
+    received = asyncio.Queue()
+    agent = make_agent(fake_cloud.url)
+    agent.set_command_callback(received.put)
+    await agent.start()
+    try:
+        await asyncio.wait_for(fake_cloud.connected.wait(), 5)
+        await fake_cloud.send_command({"commandId": "c1", "commandType": "restart", "portId": "p", "params": {}})
+        envelope = await asyncio.wait_for(received.get(), 5)
+        assert envelope["command"]["commandId"] == "c1"
+    finally:
+        await agent.stop()
+
+
+@pytest.mark.asyncio
+async def test_telemetry_dropped_while_disconnected_when_disabled():
+    agent = make_agent("ws://127.0.0.1:9/hub", buffer_telemetry_while_disconnected=False)
+    agent.queue_telemetry("p", "s", b"x")
+    assert agent.buffer_manager.get_message_count() == 0
+    agent.send_task_status_update({"task_id": "t", "status": "failed"})
+    assert agent.buffer_manager.get_message_count() == 1

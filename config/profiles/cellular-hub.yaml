@@ -1,0 +1,12 @@
+# Cellular hub: USB MCUs; prefers Wi-Fi and falls back to the cellular HAT.
+# Network switching is done by the uplink manager (wifi-fallback-relay repo), which writes
+# uplink.status_file; this hub only reports that status in its health messages.
+hub:
+  mode: bench
+
+bench:
+  source: usb
+
+buffer:
+  # Cellular outages can be long; allow more buffered telemetry
+  size_mb: 20

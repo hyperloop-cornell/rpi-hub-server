@@ -1,0 +1,6 @@
+# Lab hub: USB MCUs on lab Wi-Fi. No cellular; no uplink manager installed.
+hub:
+  mode: bench
+
+bench:
+  source: usb

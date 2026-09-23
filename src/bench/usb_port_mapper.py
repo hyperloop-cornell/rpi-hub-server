@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set
 
 import serial.tools.list_ports
 
@@ -58,16 +58,25 @@ class USBPortMapper:
         self,
         persistence_path: str = "/var/lib/rpi-hub/port_mappings.json",
         default_baud_rate: int = 9600,
+        baud_policy: Optional[Callable[["DeviceInfo"], Optional[int]]] = None,
     ):
         """Initialize USB Port Mapper.
 
         Args:
             persistence_path: Path to save port mappings
             default_baud_rate: Default baud rate fallback
+            baud_policy: Called for each new device. Return a baud rate to use it without
+                probing, 0 to skip probing (device will not be auto-connected anyway), or
+                None to probe candidate baud rates.
         """
         self.logger = StructuredLogger(__name__)
         self.persistence_path = Path(persistence_path)
         self.default_baud_rate = default_baud_rate
+        self.baud_policy = baud_policy
+
+        # USB identities (location or serial number) whose hotplug callbacks are held back,
+        # e.g. while a board re-enumerates during flashing
+        self._suppressed: Set[str] = set()
 
         # Mappings (live devices only - no cross-run caching)
         self.device_path_to_port_id: Dict[str, str] = {}
@@ -213,9 +222,9 @@ class USBPortMapper:
             
             if is_new:
                 new_devices.append(device_info)
-                
+
                 # Trigger callbacks for new devices
-                for callback in self._device_connected_callbacks:
+                for callback in ([] if self.is_suppressed(device_info) else self._device_connected_callbacks):
                     try:
                         if asyncio.iscoroutinefunction(callback):
                             await callback(device_info)
@@ -246,7 +255,7 @@ class USBPortMapper:
                 device_info = self.port_id_to_device_info.get(port_id)
                 if device_info:
                     # Trigger callbacks
-                    for callback in self._device_disconnected_callbacks:
+                    for callback in ([] if self.is_suppressed(device_info) else self._device_disconnected_callbacks):
                         try:
                             if asyncio.iscoroutinefunction(callback):
                                 await callback(device_info)
@@ -269,7 +278,8 @@ class USBPortMapper:
         self.last_scan_time = datetime.now()
         scan_duration = (self.last_scan_time - scan_start).total_seconds() * 1000
 
-        self.logger.info(
+        changed = bool(new_devices or removed_device_ids)
+        (self.logger.info if changed else self.logger.debug)(
             "port_scan_completed",
             f"Port scan completed in {scan_duration:.0f}ms",
             duration_ms=scan_duration,
@@ -464,6 +474,21 @@ class USBPortMapper:
             # Check if we already have a detected baud for this device (in-memory)
             detected_baud = self._has_detected_baud(port.device)
             
+            policy_baud = None
+            if detected_baud is None and self.baud_policy is not None:
+                probe_info = DeviceInfo(
+                    port_id="",
+                    device_path=port.device,
+                    vendor_id=vendor_id,
+                    product_id=product_id,
+                    serial_number=port.serial_number,
+                    manufacturer=port.manufacturer,
+                    product=port.product,
+                    location=port.location,
+                    description=port.description,
+                )
+                policy_baud = self.baud_policy(probe_info)
+
             if detected_baud is not None:
                 # Device already known in this session - skip detection
                 self.logger.debug(
@@ -472,6 +497,9 @@ class USBPortMapper:
                     device_path=port.device,
                     baud_rate=detected_baud,
                 )
+            elif policy_baud is not None:
+                # Known board (or a device that will not be opened): no probing
+                detected_baud = policy_baud or None
             else:
                 # New device - detect baud rate
                 detected_baud = await self._detect_baud_rate_manual(port.device)
@@ -588,7 +616,7 @@ class USBPortMapper:
             
             devices.append(device_dict)
         
-        self.logger.info(
+        self.logger.debug(
             "get_all_devices",
             f"Returning {len(devices)} devices",
             count=len(devices),
@@ -679,53 +707,37 @@ class USBPortMapper:
         """
         self._device_disconnected_callbacks.append(callback)
 
+    # Hotplug suppression
 
-# Global USB port mapper instance
-_usb_port_mapper: Optional[USBPortMapper] = None
+    @staticmethod
+    def identity_keys(device_info: "DeviceInfo") -> Set[str]:
+        """Keys that identify a physical board across re-enumeration (USB path, serial number)."""
+        keys = set()
+        if device_info.location:
+            keys.add("loc:" + device_info.location.split(":")[0])
+        if device_info.serial_number:
+            keys.add("sn:" + device_info.serial_number)
+        return keys
 
+    def is_suppressed(self, device_info: "DeviceInfo") -> bool:
+        return bool(self.identity_keys(device_info) & self._suppressed)
 
-def get_usb_port_mapper() -> USBPortMapper:
-    """Get global USB Port Mapper instance.
+    def suppress(self, device_info: "DeviceInfo") -> Set[str]:
+        """Hold back hotplug callbacks for this board; returns the keys to pass to release()."""
+        keys = self.identity_keys(device_info)
+        self._suppressed |= keys
+        return keys
 
-    Returns:
-        USBPortMapper instance
-
-    Raises:
-        RuntimeError: If USB port mapper not initialized
-    """
-    if _usb_port_mapper is None:
-        raise RuntimeError(
-            "USBPortMapper not initialized. Call initialize_usb_port_mapper() first."
-        )
-    return _usb_port_mapper
-
-
-def initialize_usb_port_mapper(
-    persistence_path: Optional[str] = None,
-    default_baud_rate: Optional[int] = None,
-    scan_interval: Optional[int] = None,
-) -> USBPortMapper:
-    """Initialize USB Port Mapper instance.
-
-    Args:
-        persistence_path: Path to save port mappings
-        default_baud_rate: Default baud rate fallback
-        scan_interval: Port scan interval (unused, for API compatibility)
-
-    Returns:
-        USBPortMapper instance
-    """
-    global _usb_port_mapper
-    
-    if _usb_port_mapper is not None:
-        return _usb_port_mapper
-    
-    from src.config import get_settings
-
-    settings = get_settings()
-    _usb_port_mapper = USBPortMapper(
-        persistence_path=persistence_path or settings.storage.port_mapping_file,
-        default_baud_rate=default_baud_rate or settings.serial.default_baud_rate,
-    )
-    
-    return _usb_port_mapper
+    async def release(self, keys: Set[str]) -> None:
+        """Stop suppressing and replay 'connected' for matching devices that are present now."""
+        self._suppressed -= keys
+        await self.refresh()
+        for device_info in list(self.port_id_to_device_info.values()):
+            if self.identity_keys(device_info) & keys:
+                for callback in self._device_connected_callbacks:
+                    try:
+                        result = callback(device_info)
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception as e:
+                        self.logger.error("callback_error", f"Error in device connected callback: {e}", error=str(e))

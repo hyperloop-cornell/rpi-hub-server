@@ -78,3 +78,6 @@ dmypy.json
 # Distribution / packaging
 *.tar.gz
 *.zip
+
+# Local state from the dev-sim profile
+.rpi-hub/

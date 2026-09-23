@@ -1,32 +1,26 @@
 # Core Framework
-fastapi==0.115.0
-uvicorn[standard]==0.32.0
-pydantic==2.9.0
-pydantic-settings==2.5.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.9.0,<3
 
 # WebSocket
-websockets==12.0
+websockets>=12.0,<18
 
 # Serial Communication
-pyserial==3.5
+pyserial>=3.5
 
 # System Monitoring
-psutil==5.9.8
+psutil>=5.9.8
 
 # Logging
-python-json-logger==2.0.7
+python-json-logger>=2.0.7
 
 # Utilities
-python-dotenv==1.0.0
-pyyaml==6.0.1
+python-dotenv>=1.0.0
+pyyaml>=6.0.1
 
 # Testing
-pytest==7.4.4
-pytest-asyncio==0.23.3
-pytest-cov==4.1.0
-pytest-mock==3.12.0
-
-# Development
-black==24.1.1
-mypy==1.8.0
-ruff==0.1.14
+pytest>=7.4.4
+pytest-asyncio>=0.23.3
+pytest-mock>=3.12.0
+httpx>=0.25.0

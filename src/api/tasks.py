@@ -1,232 +1,71 @@
-"""Task management endpoints."""
+"""Task endpoints: the same commands the cloud sends, issued locally."""
 
 import uuid
+from typing import Any, Dict
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
-from ..command_handler import get_command_handler
-from ..logging_config import get_logger
+from ..runtime import HubRuntime
+from .dependencies import get_runtime
 from .models import (
-    SerialWriteRequest,
     FlashFirmwareRequest,
     RestartDeviceRequest,
+    SerialWriteRequest,
+    TaskListResponse,
     TaskResponse,
     TaskStatusResponse,
-    TaskListResponse
 )
 
-logger = get_logger(__name__)
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
 
-@router.post("/write", response_model=TaskResponse)
-async def write_to_serial(request: SerialWriteRequest):
-    """
-    Write data to serial port.
-    
-    Args:
-        request: Write parameters
-        
-    Returns:
-        Task information
-    """
+async def _submit(
+    runtime: HubRuntime, command_type: str, port_id: str, params: Dict[str, Any], priority: int
+) -> TaskResponse:
+    if runtime.backend.get_device(port_id) is None:
+        raise HTTPException(status_code=404, detail=f"Port not found: {port_id}")
+    command = {
+        "commandId": f"local-{uuid.uuid4()}",
+        "commandType": command_type,
+        "portId": port_id,
+        "params": params,
+        "priority": priority,
+    }
     try:
-        command_handler = get_command_handler()
-        
-        # Create command envelope
-        command_id = f"cmd-{uuid.uuid4().hex[:12]}"
-        command_envelope = {
-            "commandId": command_id,
-            "commandType": "serial_write",
-            "portId": request.port_id,
-            "params": {
-                "data": request.data,
-                "encoding": request.encoding
-            },
-            "priority": request.priority
-        }
-        
-        # Submit command
-        result = await command_handler.handle_command(command_envelope)
-        
-        return TaskResponse(**result)
-        
+        return TaskResponse(**await runtime.commands.handle_command(command))
     except ValueError as e:
-        raise HTTPException(
-            status_code=400,
-            detail=str(e)
-        )
-    except Exception as e:
-        logger.error(
-            f"Failed to submit write task: {e}",
-            extra={"port_id": request.port_id},
-            exc_info=True
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to submit write task: {str(e)}"
-        )
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/write", response_model=TaskResponse)
+async def write_to_serial(request: SerialWriteRequest, runtime: HubRuntime = Depends(get_runtime)):
+    return await _submit(
+        runtime, "serial_write", request.port_id, {"data": request.data, "encoding": request.encoding}, request.priority
+    )
 
 
 @router.post("/flash", response_model=TaskResponse)
-async def flash_firmware(request: FlashFirmwareRequest):
-    """
-    Flash firmware to device.
-    
-    Args:
-        request: Flash parameters
-        
-    Returns:
-        Task information
-    """
-    try:
-        command_handler = get_command_handler()
-        
-        # Create command envelope
-        command_id = f"cmd-{uuid.uuid4().hex[:12]}"
-        command_envelope = {
-            "commandId": command_id,
-            "commandType": "flash",
-            "portId": request.port_id,
-            "params": {
-                "firmwareData": request.firmware_data,
-                "boardFqbn": request.board_fqbn
-            },
-            "priority": request.priority
-        }
-        
-        # Submit command
-        result = await command_handler.handle_command(command_envelope)
-        
-        return TaskResponse(**result)
-        
-    except ValueError as e:
-        raise HTTPException(
-            status_code=400,
-            detail=str(e)
-        )
-    except Exception as e:
-        logger.error(
-            f"Failed to submit flash task: {e}",
-            extra={"port_id": request.port_id},
-            exc_info=True
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to submit flash task: {str(e)}"
-        )
+async def flash_firmware(request: FlashFirmwareRequest, runtime: HubRuntime = Depends(get_runtime)):
+    params: Dict[str, Any] = {"firmwareData": request.firmware_data, "boardFqbn": request.board_fqbn}
+    if request.artifact_format:
+        params["artifactFormat"] = request.artifact_format
+    return await _submit(runtime, "flash", request.port_id, params, request.priority)
 
 
 @router.post("/restart", response_model=TaskResponse)
-async def restart_device(request: RestartDeviceRequest):
-    """
-    Restart device via DTR toggle.
-    
-    Args:
-        request: Restart parameters
-        
-    Returns:
-        Task information
-    """
-    try:
-        command_handler = get_command_handler()
-        
-        # Create command envelope
-        command_id = f"cmd-{uuid.uuid4().hex[:12]}"
-        command_envelope = {
-            "commandId": command_id,
-            "commandType": "restart",
-            "portId": request.port_id,
-            "params": {},
-            "priority": request.priority
-        }
-        
-        # Submit command
-        result = await command_handler.handle_command(command_envelope)
-        
-        return TaskResponse(**result)
-        
-    except ValueError as e:
-        raise HTTPException(
-            status_code=400,
-            detail=str(e)
-        )
-    except Exception as e:
-        logger.error(
-            f"Failed to submit restart task: {e}",
-            extra={"port_id": request.port_id},
-            exc_info=True
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to submit restart task: {str(e)}"
-        )
+async def restart_device(request: RestartDeviceRequest, runtime: HubRuntime = Depends(get_runtime)):
+    return await _submit(runtime, "restart", request.port_id, {}, request.priority)
 
 
 @router.get("/{task_id}", response_model=TaskStatusResponse)
-async def get_task_status(task_id: str):
-    """
-    Get task status and details.
-    
-    Args:
-        task_id: Task identifier
-        
-    Returns:
-        Task status information
-    """
-    try:
-        command_handler = get_command_handler()
-        
-        task = command_handler.get_task(task_id)
-        if not task:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Task not found: {task_id}"
-            )
-        
-        task_dict = task.to_dict()
-        return TaskStatusResponse(**task_dict)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(
-            f"Failed to get task status: {e}",
-            extra={"task_id": task_id},
-            exc_info=True
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to get task status: {str(e)}"
-        )
+async def get_task_status(task_id: str, runtime: HubRuntime = Depends(get_runtime)):
+    task = runtime.commands.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+    return TaskStatusResponse(**task.to_dict())
 
 
 @router.get("", response_model=TaskListResponse)
-async def list_tasks():
-    """
-    List all tasks.
-    
-    Returns:
-        List of all tasks with their status
-    """
-    try:
-        command_handler = get_command_handler()
-        
-        all_tasks = command_handler.get_all_tasks()
-        
-        tasks = [TaskStatusResponse(**task) for task in all_tasks]
-        
-        return TaskListResponse(
-            tasks=tasks,
-            count=len(tasks)
-        )
-        
-    except Exception as e:
-        logger.error(
-            f"Failed to list tasks: {e}",
-            exc_info=True
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to list tasks: {str(e)}"
-        )
+async def list_tasks(runtime: HubRuntime = Depends(get_runtime)):
+    tasks = [TaskStatusResponse(**task) for task in runtime.commands.get_all_tasks()]
+    return TaskListResponse(tasks=tasks, count=len(tasks))

@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from src.buffer_manager import BufferManager, BufferedMessage
+from src.uplink.buffer_manager import BufferManager, BufferedMessage
 
 
 @pytest.fixture
@@ -16,7 +16,7 @@ def buffer_manager():
 @pytest.mark.asyncio
 async def test_buffer_manager_initialization(buffer_manager):
     """Test buffer manager initialization."""
-    assert buffer_manager.size_bytes == 1024  # 0.001 MB = 1024 bytes
+    assert buffer_manager.size_bytes == int(0.001 * 1024 * 1024)
     assert buffer_manager.warn_threshold == 0.8
     assert buffer_manager.current_size_bytes == 0
     assert len(buffer_manager.buffer) == 0
@@ -266,3 +266,45 @@ async def test_buffered_message_dataclass():
     assert msg.message_type == "telemetry"
     assert msg.payload["test"] == "data"
     assert msg.size_bytes == 100
+
+
+@pytest.mark.asyncio
+async def test_overflow_drops_telemetry_before_other_messages():
+    """Task results and device events survive a long outage; telemetry is dropped first."""
+    buffer = BufferManager(size_mb=0.001)
+    buffer.add_message("task_status", {"taskId": "t1", "status": "completed"})
+    for i in range(50):
+        buffer.add_message("telemetry", {"data": "x" * 50, "i": i})
+    types = [m.message_type for m in buffer.buffer]
+    assert types[0] == "task_status"
+    assert buffer.get_stats()["total_drops"] > 0
+    assert buffer.current_size_bytes <= buffer.size_bytes
+
+
+@pytest.mark.asyncio
+async def test_requeue_front_preserves_order():
+    buffer = BufferManager(size_mb=1)
+    buffer.add_message("telemetry", {"i": 1})
+    buffer.add_message("telemetry", {"i": 2})
+    first = await buffer.pop_message()
+    buffer.requeue_front(first)
+    assert [m.payload["i"] for m in buffer.buffer] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_message_wakes_on_add():
+    buffer = BufferManager(size_mb=1)
+    waiter = asyncio.create_task(buffer.wait_for_message(timeout=2))
+    await asyncio.sleep(0)
+    buffer.add_message("health", {"ok": True})
+    assert await waiter is True
+    assert await buffer.wait_for_message(timeout=0.01) is True
+    await buffer.pop_message()
+    assert await buffer.wait_for_message(timeout=0.01) is False
+
+
+@pytest.mark.asyncio
+async def test_oversized_message_rejected():
+    buffer = BufferManager(size_mb=0.001)
+    assert buffer.add_message("telemetry", {"data": "x" * 5000}) is False
+    assert buffer.get_message_count() == 0

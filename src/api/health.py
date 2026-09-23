@@ -1,51 +1,29 @@
 """Health check endpoints."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends
 
-from ..health_reporter import get_health_reporter
-from ..logging_config import get_logger
-from .models import HealthResponse, DetailedStatusResponse
+from ..runtime import HubRuntime
+from .dependencies import get_runtime
+from .models import DetailedStatusResponse, HealthResponse
 
-logger = get_logger(__name__)
 router = APIRouter(prefix="", tags=["health"])
 
 
 @router.get("/health", response_model=HealthResponse)
-async def health_check():
-    """
-    Basic health check endpoint.
-    
-    Returns:
-        Basic health status
-    """
+async def health_check(runtime: HubRuntime = Depends(get_runtime)):
+    """Liveness check (also reports whether the cloud uplink is connected)."""
     return HealthResponse(
         status="healthy",
-        timestamp=datetime.utcnow()
+        timestamp=datetime.now(timezone.utc),
+        hub_id=runtime.settings.hub.hub_id,
+        uplink_connected=runtime.agent.is_connected,
     )
 
 
 @router.get("/status", response_model=DetailedStatusResponse)
-async def detailed_status():
-    """
-    Detailed status with comprehensive metrics.
-    
-    Returns:
-        Detailed health and service metrics
-    """
-    try:
-        health_reporter = get_health_reporter()
-        metrics = await health_reporter.collect_health_metrics()
-        
-        return DetailedStatusResponse(**metrics)
-        
-    except Exception as e:
-        logger.error(
-            f"Failed to collect status metrics: {e}",
-            exc_info=True
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to collect status: {str(e)}"
-        )
+async def detailed_status(runtime: HubRuntime = Depends(get_runtime)):
+    """Everything the hub reports in its health messages, plus uplink agent state."""
+    metrics = await runtime.health.collect_health_metrics()
+    return DetailedStatusResponse(**metrics, uplink_agent=runtime.agent.get_connection_status())

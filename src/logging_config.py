@@ -153,7 +153,7 @@ class StructuredLogger:
 
     def serial_read(self, port_id: str, bytes_read: int, data_hex: str = "") -> None:
         """Log serial read event."""
-        self.info(
+        self.debug(
             "serial_read",
             f"Read {bytes_read} bytes from {port_id}",
             port_id=port_id,
@@ -163,7 +163,7 @@ class StructuredLogger:
 
     def serial_write(self, port_id: str, bytes_written: int) -> None:
         """Log serial write event."""
-        self.info(
+        self.debug(
             "serial_write",
             f"Wrote {bytes_written} bytes to {port_id}",
             port_id=port_id,
@@ -172,7 +172,7 @@ class StructuredLogger:
 
     def ws_send(self, msg_type: str, **context: Any) -> None:
         """Log WebSocket send event."""
-        self.info(
+        self.debug(
             "ws_send",
             f"Sending {msg_type} message",
             msg_type=msg_type,
@@ -181,7 +181,7 @@ class StructuredLogger:
 
     def ws_receive(self, msg_type: str, **context: Any) -> None:
         """Log WebSocket receive event."""
-        self.info(
+        self.debug(
             "ws_receive",
             f"Received {msg_type} message",
             msg_type=msg_type,

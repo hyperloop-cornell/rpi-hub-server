@@ -1,0 +1,30 @@
+# Development: simulated boards, no hardware. Runs on a laptop against a local cloud-services:
+#   HUB_PROFILE=dev-sim HUB_ID=rpi-bridge-01 DEVICE_TOKEN=dev-token-rpi-bridge-01 python -m src.main
+hub:
+  server_endpoint: ${SERVER_ENDPOINT:ws://localhost:8080/hub}
+  device_token: "${DEVICE_TOKEN:dev-token-rpi-bridge-01}"
+
+bench:
+  source: sim
+  sim_devices:
+    - name: sim-uno
+      generator: dht22
+    - name: sim-mega
+      generator: mpu6050
+      baud: 115200
+      product_id: "0042"
+      product: Arduino Mega 2560
+    - name: sim-nano
+      generator: voltage
+      vendor_id: "1a86"
+      product_id: "7523"
+      product: USB Serial (CH340)
+      manufacturer: QinHeng Electronics
+
+storage:
+  port_mapping_file: ${PORT_MAPPING_FILE:.rpi-hub/port_mappings.json}
+  log_directory: ${LOG_DIRECTORY:.rpi-hub/logs}
+  artifact_cache_path: ${ARTIFACT_CACHE_PATH:.rpi-hub/artifacts}
+
+logging:
+  format: text
