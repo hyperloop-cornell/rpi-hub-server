@@ -204,3 +204,16 @@ def test_app_serves_local_api_with_sim_profile(monkeypatch, tmp_path):
         status = client.get("/status").json()
         assert status["uplink_agent"]["is_connected"] is False
         assert status["profile"]["mode"] == "bench"
+
+
+@pytest.mark.asyncio
+async def test_bootloader_boards_stay_closed_even_with_all_policy(fake_cloud, tmp_path):
+    bootloader = SimDeviceSpec(name="r4-boot", product_id="0369", product="UNO R4 bootloader")
+    backend = SimBenchBackend(hub_id="h", specs=[bootloader], speedup=50, registry=REGISTRY)
+    rt = HubRuntime(settings_for(fake_cloud.url, tmp_path, auto_connect="all"), backend=backend)
+    await rt.start()
+    try:
+        await asyncio.sleep(0.2)
+        assert backend.connections() == []
+    finally:
+        await rt.stop()

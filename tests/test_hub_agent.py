@@ -178,3 +178,14 @@ async def test_telemetry_dropped_while_disconnected_when_disabled():
     assert agent.buffer_manager.get_message_count() == 0
     agent.send_task_status_update({"task_id": "t", "status": "failed"})
     assert agent.buffer_manager.get_message_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_message_kept_when_connection_is_gone():
+    agent = make_agent("ws://127.0.0.1:9/hub")
+    agent.queue_telemetry("p", "s", b"keep-me")
+    agent._running = True
+    agent.is_connected = True
+    agent.ws_connection = None
+    await asyncio.wait_for(agent._send_loop(), 2)
+    assert agent.buffer_manager.get_message_count() == 1

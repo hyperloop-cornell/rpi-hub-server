@@ -171,6 +171,9 @@ class HubRuntime:
     # ------------------------------------------------------------------ backend events
 
     def should_auto_connect(self, device: BenchDevice) -> bool:
+        # Boards the registry marks as never-open (bootloader modes) stay closed under any policy
+        if device.board is not None and not getattr(device.board, "auto_connect", True):
+            return False
         policy = self.settings.auto_connect_policy
         if policy == "all":
             return True

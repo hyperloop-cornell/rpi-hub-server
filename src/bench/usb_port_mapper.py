@@ -78,6 +78,10 @@ class USBPortMapper:
         # e.g. while a board re-enumerates during flashing
         self._suppressed: Set[str] = set()
 
+        # The scan loop and flash/restart waits both call refresh(); run one at a time so the
+        # same device is never reported as new twice
+        self._refresh_lock = asyncio.Lock()
+
         # Mappings (live devices only - no cross-run caching)
         self.device_path_to_port_id: Dict[str, str] = {}
         self.port_id_to_device_info: Dict[str, DeviceInfo] = {}
@@ -163,6 +167,10 @@ class USBPortMapper:
 
     async def refresh(self) -> None:
         """Scan for USB devices and update mappings."""
+        async with self._refresh_lock:
+            await self._refresh_unlocked()
+
+    async def _refresh_unlocked(self) -> None:
         scan_start = datetime.now()
 
         # Get current ports from scan
