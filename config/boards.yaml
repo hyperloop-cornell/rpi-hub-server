@@ -1,0 +1,130 @@
+# Board registry: how the hub recognizes, opens, resets and flashes each board.
+#
+# Devices are matched by USB vendor/product id (lowercase hex). Entries with a product id win
+# over vendor-wide entries (no product id). With bench.auto_connect: known_boards, only devices
+# matching an entry with auto_connect: true are opened, so cellular modem ports (SIMCom 1e0e,
+# Quectel 2c7c, Sierra 1199, Huawei 12d1) are never touched.
+#
+# VID/PID values marked "verify" come from vendor documentation; confirm them with `lsusb` on
+# real hardware (see .claude/rpi-hub-setup.md) and correct this file if a board is not detected.
+#
+# Fields:
+#   match:         list of {vid, pid?}
+#   fqbn:          arduino-cli board id (compiling .ino and arduino-cli uploads)
+#   artifacts:     firmware formats this board accepts: ino, hex, bin, elf
+#   flasher:       arduino-cli | openocd | none
+#   openocd_config OpenOCD board/target script (flasher: openocd)
+#   baud:          default serial baud (skips baud probing); omit to probe 9600/115200
+#   reset:         dtr | openocd | none   (how "restart" resets the board)
+#   reset_on_open: pulse DTR when opening the port (classic Arduinos restart their sketch)
+#   auto_connect:  open automatically when detected (false for bootloader modes)
+
+boards:
+  # --- Arduino AVR -------------------------------------------------------------------------
+  - id: uno_r3
+    name: Arduino Uno R3
+    match:
+      - {vid: "2341", pid: "0043"}
+      - {vid: "2341", pid: "0001"}
+      - {vid: "2a03", pid: "0043"}
+    fqbn: arduino:avr:uno
+    artifacts: [ino, hex]
+    flasher: arduino-cli
+    reset: dtr
+
+  - id: mega2560
+    name: Arduino Mega 2560
+    match:
+      - {vid: "2341", pid: "0042"}
+      - {vid: "2341", pid: "0010"}
+      - {vid: "2a03", pid: "0042"}
+    fqbn: arduino:avr:mega
+    artifacts: [ino, hex]
+    flasher: arduino-cli
+    reset: dtr
+
+  - id: nano_ch340
+    name: Arduino Nano (CH340 clone)
+    match:
+      - {vid: "1a86", pid: "7523"}
+    fqbn: arduino:avr:nano
+    artifacts: [ino, hex]
+    flasher: arduino-cli
+    reset: dtr
+
+  # --- Arduino Uno R4 (Renesas RA4M1) --------------------------------------------------------
+  - id: uno_r4_minima
+    name: Arduino Uno R4 Minima
+    match:
+      - {vid: "2341", pid: "0069"}  # verify
+    fqbn: arduino:renesas_uno:minima
+    artifacts: [ino, bin]
+    flasher: arduino-cli
+    baud: 115200
+    # Native USB: DTR does not reset the MCU, and a 1200-baud open enters the bootloader
+    reset: none
+    reset_on_open: false
+
+  - id: uno_r4_minima_bootloader
+    name: Arduino Uno R4 Minima (bootloader)
+    match:
+      - {vid: "2341", pid: "0369"}  # verify
+    fqbn: arduino:renesas_uno:minima
+    artifacts: []
+    flasher: none
+    auto_connect: false
+
+  - id: uno_r4_wifi
+    name: Arduino Uno R4 WiFi
+    match:
+      - {vid: "2341", pid: "1002"}  # verify
+    fqbn: arduino:renesas_uno:unor4wifi
+    artifacts: [ino, bin]
+    flasher: arduino-cli
+    baud: 115200
+    reset: dtr
+
+  # --- STM32 ---------------------------------------------------------------------------------
+  # STM32F407G-DISC1: serial through the on-board ST-LINK virtual COM port, flashing and reset
+  # through the ST-LINK debug interface with OpenOCD (STM32CubeProgrammer has no ARM64 build).
+  - id: disco_f407vg
+    name: STM32F407G-DISC1
+    match:
+      - {vid: "0483", pid: "374b"}  # ST-LINK/V2-1, verify
+      - {vid: "0483", pid: "3752"}  # ST-LINK/V2-1 without mass storage, verify
+      - {vid: "0483", pid: "3748"}  # ST-LINK/V2 (no virtual COM port)
+    fqbn: STMicroelectronics:stm32:Disco:pnum=DISCO_F407VG
+    artifacts: [ino, bin, elf, hex]
+    flasher: openocd
+    openocd_config: board/stm32f4discovery.cfg
+    baud: 115200
+    reset: openocd
+    reset_on_open: false
+    compile_timeout: 900
+
+  # --- Generic USB-serial bridges (auto-connect, but board type must be chosen to flash) ----
+  - id: generic_arduino
+    name: Arduino (unrecognized model)
+    match:
+      - {vid: "2341"}
+      - {vid: "2a03"}
+    artifacts: [ino, hex, bin]
+    flasher: arduino-cli
+    reset: dtr
+
+  - id: usb_serial_cp210x
+    name: USB serial (CP210x)
+    match:
+      - {vid: "10c4", pid: "ea60"}
+    artifacts: [ino, hex]
+    flasher: arduino-cli
+    reset: dtr
+
+  - id: usb_serial_ftdi
+    name: USB serial (FTDI)
+    match:
+      - {vid: "0403", pid: "6001"}
+      - {vid: "0403", pid: "6015"}
+    artifacts: [ino, hex]
+    flasher: arduino-cli
+    reset: dtr

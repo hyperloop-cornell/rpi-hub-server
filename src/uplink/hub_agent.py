@@ -231,8 +231,12 @@ class HubAgent:
             if not await self.buffer_manager.wait_for_message(timeout=1.0):
                 continue
             message = await self.buffer_manager.pop_message()
-            if message is None or self.ws_connection is None:
+            if message is None:
                 continue
+            connection = self.ws_connection
+            if connection is None:
+                self.buffer_manager.requeue_front(message)
+                return
 
             envelope = {
                 "type": message.message_type,
@@ -241,12 +245,16 @@ class HubAgent:
                 **message.payload,
             }
             try:
-                await self.ws_connection.send(json.dumps(envelope))
+                await connection.send(json.dumps(envelope))
             except ConnectionClosed:
                 # Keep the message for the next connection
                 self.buffer_manager.requeue_front(message)
                 self.logger.warning("ws_connection_closed", "Connection closed during send")
                 return
+            except asyncio.CancelledError:
+                # Connection is being torn down (receiver saw the close first); resend later
+                self.buffer_manager.requeue_front(message)
+                raise
             self.logger.ws_send(message.message_type, payload_bytes=message.size_bytes)
 
     async def _receive_loop(self) -> None:

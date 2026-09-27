@@ -339,3 +339,20 @@ async def test_suppressed_board_callbacks_replayed_on_release(usb_mapper, mock_p
 
     assert connected == ["/dev/ttyACM0"]
     assert disconnected == []
+
+
+
+@pytest.mark.asyncio
+async def test_concurrent_refreshes_report_new_device_once(usb_mapper, mock_pyserial_ports):
+    connected = []
+    usb_mapper.on_device_connected(lambda info: connected.append(info.device_path))
+
+    async def slow_probe(path):
+        await asyncio.sleep(0.05)
+        return 9600
+
+    with patch("serial.tools.list_ports.comports", return_value=mock_pyserial_ports), \
+            patch.object(usb_mapper, "_detect_baud_rate_manual", new=slow_probe):
+        await asyncio.gather(usb_mapper.refresh(), usb_mapper.refresh())
+
+    assert sorted(connected) == ["/dev/ttyUSB0", "/dev/ttyUSB1"]

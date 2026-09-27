@@ -23,8 +23,10 @@ serial:
 bench:
   # usb = real devices, sim = simulated devices (no hardware needed)
   source: ${BENCH_SOURCE:usb}
-  # all = open every USB serial device; known_boards = only boards in config/boards.yaml
-  auto_connect: ${BENCH_AUTO_CONNECT:all}
+  # known_boards = only boards in config/boards.yaml (keeps cellular modem ports untouched);
+  # all = open every USB serial device
+  auto_connect: ${BENCH_AUTO_CONNECT:known_boards}
+  boards_file: ${BOARDS_FILE:config/boards.yaml}
 
 buffer:
   size_mb: ${BUFFER_SIZE_MB:10}

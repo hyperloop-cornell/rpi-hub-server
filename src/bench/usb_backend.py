@@ -13,7 +13,8 @@ from .backend import (
     FlashRequest,
     new_session_id,
 )
-from .flashing import ArduinoCliFlasher, FirmwareFormatError, ToolError, detect_format
+from .boards import BoardProfile, BoardRegistry
+from .flashing import ArduinoCliFlasher, FirmwareFormatError, OpenOcdFlasher, ToolError, detect_format
 from .serial_manager import SerialManager, SerialWriteError
 from .usb_port_mapper import DeviceInfo, USBPortMapper
 
@@ -31,8 +32,8 @@ class UsbBenchBackend(BenchBackend):
         serial_manager: SerialManager,
         default_baud_rate: int = 9600,
         scan_interval: int = 2,
-        flasher: Optional[ArduinoCliFlasher] = None,
-        board_resolver: Optional[Callable[[DeviceInfo], Any]] = None,
+        registry: Optional[BoardRegistry] = None,
+        flasher_factory: Optional[Callable[[Optional[BoardProfile], BenchDevice], Any]] = None,
     ):
         super().__init__()
         self.logger = StructuredLogger(__name__)
@@ -41,8 +42,9 @@ class UsbBenchBackend(BenchBackend):
         self.serial = serial_manager
         self.default_baud_rate = default_baud_rate
         self.scan_interval = scan_interval
-        self.flasher = flasher or ArduinoCliFlasher()
-        self.board_resolver = board_resolver
+        self.registry = registry or BoardRegistry()
+        self.flasher_factory = flasher_factory or default_flasher
+        self.flash_formats = self.registry.artifact_formats() or ["ino", "hex"]
         self._flashing: set = set()
 
     # ------------------------------------------------------------------ lifecycle
@@ -76,7 +78,7 @@ class UsbBenchBackend(BenchBackend):
             description=info.description or "",
             location=info.location,
             detected_baud=info.detected_baud,
-            board=self.board_resolver(info) if self.board_resolver else None,
+            board=self.registry.match_device(info),
         )
 
     def devices(self) -> List[BenchDevice]:
@@ -162,10 +164,25 @@ class UsbBenchBackend(BenchBackend):
             await self.serial.close_connection(port_id)
         await asyncio.sleep(0.2)
 
-        # Reopen with a DTR pulse at the session's own baud rate. Never open at 1200 baud to
-        # reset: that "touch" puts native-USB boards (Uno R4, Leonardo) into their bootloader.
+        method = device.board.reset if device.board else "dtr"
+        if method == "openocd":
+            try:
+                await OpenOcdFlasher(device.board.openocd_config, adapter_serial=device.serial_number).reset()
+            except ToolError as e:
+                raise BenchError(f"Reset failed: {e}") from e
+
+        # "dtr": reopen with a DTR pulse at the session's own baud rate. Never open at 1200 baud
+        # to reset: that "touch" puts native-USB boards (Uno R4, Leonardo) into their bootloader.
         await self._wait_for_device(device)
-        return await self._open(port_id, baud, force_reset=True)
+        return await self._open(port_id, baud, force_reset=method == "dtr")
+
+    def _board_for_flash(self, device: BenchDevice, request: FlashRequest) -> Optional[BoardProfile]:
+        if request.board_profile:
+            board = self.registry.get(request.board_profile)
+            if board is None:
+                raise BenchError(f"Unknown board profile: {request.board_profile}")
+            return board
+        return device.board
 
     async def flash(self, port_id: str, request: FlashRequest) -> Dict[str, Any]:
         device = self._require_device(port_id)
@@ -173,6 +190,16 @@ class UsbBenchBackend(BenchBackend):
             artifact_format = detect_format(request.firmware, request.artifact_format)
         except FirmwareFormatError as e:
             raise BenchError(str(e)) from e
+
+        board = self._board_for_flash(device, request)
+        if board is not None:
+            if board.flasher == "none":
+                raise BenchError(f"{board.name} cannot be flashed in its current mode")
+            if board.artifacts and artifact_format not in board.artifacts:
+                accepted = ", ".join(f".{a}" for a in board.artifacts)
+                raise BenchError(f"{board.name} does not accept .{artifact_format} firmware (accepts {accepted})")
+        fqbn = request.board_fqbn or (board.fqbn if board else None)
+        flasher = self.flasher_factory(board, device)
 
         connection = self.serial.get_connection(port_id)
         baud = connection.baud_rate if connection else None
@@ -184,9 +211,7 @@ class UsbBenchBackend(BenchBackend):
         self._flashing.add(port_id)
         try:
             await asyncio.sleep(0.5)  # let the port settle
-            result = await self.flasher.flash(
-                device.device_path, request.firmware, artifact_format, request.board_fqbn
-            )
+            result = await flasher.flash(device.device_path, request.firmware, artifact_format, fqbn)
         except ToolError as e:
             raise BenchError(str(e)) from e
         finally:
@@ -200,7 +225,12 @@ class UsbBenchBackend(BenchBackend):
         except BenchError as e:
             self.logger.warning("reopen_after_flash_failed", f"Flashed but could not reopen {port_id}: {e}")
 
-        return {"port_id": port_id, "artifact_format": artifact_format, **result}
+        return {
+            "port_id": port_id,
+            "artifact_format": artifact_format,
+            "board_profile": board.id if board else None,
+            **result,
+        }
 
     async def _wait_for_device(self, device: BenchDevice) -> None:
         """Wait until the device (by port_id) is present again after a reset."""
@@ -234,3 +264,17 @@ class UsbBenchBackend(BenchBackend):
     async def _on_serial_lost(self, port_id: str, session_id: str) -> None:
         if self.listener:
             await self.listener.on_connection_lost(port_id, session_id, "serial_error")
+
+
+def default_flasher(board: Optional[BoardProfile], device: BenchDevice):
+    """Pick the flashing tool for a board (arduino-cli unless the board says OpenOCD)."""
+    compile_timeout = board.compile_timeout if board else 300.0
+    upload_timeout = board.upload_timeout if board else 120.0
+    compiler = ArduinoCliFlasher(compile_timeout=compile_timeout, upload_timeout=upload_timeout)
+    if board is not None and board.flasher == "openocd":
+        if not board.openocd_config:
+            raise BenchError(f"{board.name} has no openocd_config in config/boards.yaml")
+        return OpenOcdFlasher(
+            board.openocd_config, adapter_serial=device.serial_number, compiler=compiler, timeout=upload_timeout
+        )
+    return compiler

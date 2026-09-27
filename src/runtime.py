@@ -7,9 +7,11 @@ Nothing below this module reaches for globals; everything gets its collaborators
 """
 
 import asyncio
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.bench.backend import BenchBackend, BenchConnection, BenchDevice
+from src.bench.boards import BoardRegistry
 from src.bench.command_handler import CommandHandler
 from src.config import Settings
 from src.health.health_reporter import HealthReporter
@@ -28,23 +30,41 @@ LOST_CONNECTION_RETRY_SECONDS = 3.0
 LOST_CONNECTION_MAX_RETRIES = 3
 
 
-def create_backend(settings: Settings) -> BenchBackend:
+def load_registry(settings: Settings) -> BoardRegistry:
+    path = Path(settings.bench.boards_file)
+    if not path.exists():
+        logger.warning(f"Board registry {path} not found; no boards will be recognized")
+        return BoardRegistry()
+    return BoardRegistry.load(path)
+
+
+def create_backend(settings: Settings, registry: Optional[BoardRegistry] = None) -> BenchBackend:
     """Build the bench backend selected by bench.source."""
     hub_id = settings.hub.hub_id
+    registry = registry if registry is not None else load_registry(settings)
 
     if settings.bench.source == "sim":
         from src.sim import SimBenchBackend, SimDeviceSpec
 
         specs = [SimDeviceSpec.from_config(raw) for raw in settings.bench.sim_devices] or None
-        return SimBenchBackend(hub_id=hub_id, specs=specs, speedup=settings.bench.sim_speedup)
+        return SimBenchBackend(hub_id=hub_id, specs=specs, speedup=settings.bench.sim_speedup, registry=registry)
 
     from src.bench.serial_manager import SerialManager
     from src.bench.usb_backend import UsbBenchBackend
     from src.bench.usb_port_mapper import USBPortMapper
 
+    if settings.auto_connect_policy == "known_boards":
+        # Unknown devices will not be opened, so never probe them (e.g. modem AT ports)
+        baud_policy = registry.baud_policy
+    else:
+        def baud_policy(info):
+            board = registry.match_device(info)
+            return board.baud if board else None
+
     mapper = USBPortMapper(
         persistence_path=settings.storage.port_mapping_file,
         default_baud_rate=settings.serial.default_baud_rate,
+        baud_policy=baud_policy,
     )
     serial_manager = SerialManager(
         max_connections=settings.serial.max_connections,
@@ -57,6 +77,7 @@ def create_backend(settings: Settings) -> BenchBackend:
         serial_manager=serial_manager,
         default_baud_rate=settings.serial.default_baud_rate,
         scan_interval=settings.serial.scan_interval,
+        registry=registry,
     )
 
 
@@ -150,6 +171,9 @@ class HubRuntime:
     # ------------------------------------------------------------------ backend events
 
     def should_auto_connect(self, device: BenchDevice) -> bool:
+        # Boards the registry marks as never-open (bootloader modes) stay closed under any policy
+        if device.board is not None and not getattr(device.board, "auto_connect", True):
+            return False
         policy = self.settings.auto_connect_policy
         if policy == "all":
             return True

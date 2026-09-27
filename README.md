@@ -67,9 +67,30 @@ Notable settings:
 | `hub.mode` | `bench` | `pod` (EtherCAT master) is reserved and rejected until implemented |
 | `hub.max_reconnect_attempts` | `0` | `0` = never stop reconnecting |
 | `bench.source` | `usb` | `sim` for simulated boards |
-| `bench.auto_connect` | `all` | `known_boards` opens only boards in the board registry |
+| `bench.auto_connect` | `known_boards` | Only open boards in `config/boards.yaml`; `all` opens every USB serial device |
 | `api.host` | `127.0.0.1` | The local API can flash MCUs and has no auth; keep it on loopback |
 | `uplink.status_file` | `/run/hyperloop-uplink/status.json` | Written by the uplink manager on the cellular hub |
+
+## Supported boards
+
+`config/boards.yaml` maps USB vendor/product ids to boards: FQBN, accepted firmware formats,
+flashing tool, default baud and reset method. Shipped entries:
+
+| Board | Firmware | Flashed with | Restart |
+|---|---|---|---|
+| Arduino Uno R3, Mega 2560, Nano (CH340) | `.ino`, `.hex` | arduino-cli | DTR |
+| Arduino Uno R4 Minima / WiFi | `.ino`, `.bin` | arduino-cli | reopen only (Minima) / DTR (WiFi) |
+| STM32F407G-DISC1 | `.ino`, `.bin`, `.elf`, `.hex` | OpenOCD over the on-board ST-LINK | OpenOCD reset |
+| Other Arduino / CP210x / FTDI bridges | `.ino`, `.hex` | arduino-cli (pick the board type in the GUI) | DTR |
+
+With `bench.auto_connect: known_boards` (the default) only devices in this file are opened, which
+keeps the cellular modem's serial ports untouched. To add a board, add an entry with its `lsusb`
+ids; entries with a product id take precedence over vendor-wide ones. Boards are reported to the
+cloud in `device_event.deviceInfo.board_profile`, and the hub advertises the formats it can flash
+as `flash:<format>` capabilities.
+
+Flashing a board re-enumerates it (Uno R4 enters its bootloader on a new USB id); the hub holds
+back hotplug handling for that board until the flash finishes, then reopens its session.
 
 ## Local API
 

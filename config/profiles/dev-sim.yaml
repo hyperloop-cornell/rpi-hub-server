@@ -20,6 +20,18 @@ bench:
       product_id: "7523"
       product: USB Serial (CH340)
       manufacturer: QinHeng Electronics
+    - name: sim-uno-r4
+      generator: current
+      baud: 115200
+      product_id: "0069"
+      product: UNO R4 Minima
+    - name: sim-f407
+      generator: bme280
+      baud: 115200
+      vendor_id: "0483"
+      product_id: "374b"
+      product: STM32 STLink
+      manufacturer: STMicroelectronics
 
 storage:
   port_mapping_file: ${PORT_MAPPING_FILE:.rpi-hub/port_mappings.json}
