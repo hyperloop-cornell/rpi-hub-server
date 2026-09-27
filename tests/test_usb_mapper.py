@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
-from src.usb_port_mapper import DeviceInfo, MappedConnection, USBPortMapper
+from src.bench.usb_port_mapper import DeviceInfo, MappedConnection, USBPortMapper
 
 
 @pytest.fixture
@@ -86,29 +86,6 @@ async def test_usb_mapper_initialization(usb_mapper):
     assert usb_mapper.last_scan_time is None
 
 
-@pytest.mark.asyncio
-async def test_check_arduino_cli_available(usb_mapper):
-    """Test arduino-cli availability check."""
-    with patch("asyncio.create_subprocess_exec") as mock_exec:
-        mock_process = AsyncMock()
-        mock_process.returncode = 0
-        mock_process.communicate = AsyncMock(return_value=(b"", b""))
-        mock_exec.return_value = mock_process
-
-        result = await usb_mapper._check_arduino_cli()
-        assert result is True
-        assert usb_mapper._arduino_cli_available is True
-
-
-@pytest.mark.asyncio
-async def test_check_arduino_cli_unavailable(usb_mapper):
-    """Test arduino-cli unavailable."""
-    with patch("asyncio.create_subprocess_exec") as mock_exec:
-        mock_exec.side_effect = FileNotFoundError()
-
-        result = await usb_mapper._check_arduino_cli()
-        assert result is False
-        assert usb_mapper._arduino_cli_available is False
 
 
 @pytest.mark.asyncio
@@ -124,25 +101,6 @@ async def test_detect_with_pyserial(usb_mapper, mock_pyserial_ports):
         assert devices[0].serial_number == "12345"
         assert devices[0].detected_baud == 9600  # Default
 
-
-@pytest.mark.asyncio
-async def test_detect_with_arduino_cli(usb_mapper, mock_arduino_cli_output):
-    """Test port detection with arduino-cli."""
-    with patch("asyncio.create_subprocess_exec") as mock_exec:
-        mock_process = AsyncMock()
-        mock_process.returncode = 0
-        mock_process.communicate = AsyncMock(
-            return_value=(json.dumps(mock_arduino_cli_output).encode(), b"")
-        )
-        mock_exec.return_value = mock_process
-
-        devices = await usb_mapper._detect_with_arduino_cli()
-
-        assert len(devices) == 1
-        assert devices[0].device_path == "/dev/ttyUSB0"
-        assert devices[0].vendor_id == "2341"
-        assert devices[0].product_id == "0043"
-        assert devices[0].detected_baud == 115200  # Arduino Uno default
 
 
 @pytest.mark.asyncio
@@ -188,35 +146,6 @@ async def test_get_port_id_different_devices(usb_mapper):
     assert port_id1 != port_id2
 
 
-@pytest.mark.asyncio
-async def test_detect_new_devices(usb_mapper, mock_pyserial_ports):
-    """Test new device detection."""
-    with patch("serial.tools.list_ports.comports", return_value=mock_pyserial_ports):
-        usb_mapper._arduino_cli_available = False
-        new_devices = await usb_mapper.detect_new_devices()
-
-        assert len(new_devices) == 2
-
-
-@pytest.mark.asyncio
-async def test_detect_removed_devices(usb_mapper, mock_pyserial_ports):
-    """Test removed device detection."""
-    # Add a device to mappings
-    device_info = DeviceInfo(
-        port_id="port_test",
-        device_path="/dev/ttyUSB9",
-        serial_number="99999",
-    )
-    usb_mapper.device_path_to_port_id["/dev/ttyUSB9"] = "port_test"
-    usb_mapper.port_id_to_device_info["port_test"] = device_info
-
-    # Mock current ports (without the removed device)
-    with patch("serial.tools.list_ports.comports", return_value=mock_pyserial_ports):
-        usb_mapper._arduino_cli_available = False
-        removed = await usb_mapper.detect_removed_devices()
-
-        assert len(removed) == 1
-        assert "port_test" in removed
 
 
 @pytest.mark.asyncio
@@ -325,52 +254,6 @@ async def test_remove_mapping(usb_mapper):
     assert result is False
 
 
-@pytest.mark.asyncio
-async def test_save_mappings(usb_mapper, temp_persistence_path):
-    """Test save mappings to disk."""
-    device_info = DeviceInfo(
-        port_id="port_test",
-        device_path="/dev/ttyUSB0",
-        vendor_id="2341",
-        serial_number="12345",
-        detected_baud=115200,
-    )
-    usb_mapper.port_id_to_device_info["port_test"] = device_info
-
-    await usb_mapper.save_mappings()
-
-    assert Path(temp_persistence_path).exists()
-
-    with open(temp_persistence_path, "r") as f:
-        data = json.load(f)
-
-    assert "mappings" in data
-    assert "port_test" in data["mappings"]
-    assert data["mappings"]["port_test"]["device_path"] == "/dev/ttyUSB0"
-    assert data["mappings"]["port_test"]["detected_baud"] == 115200
-
-
-@pytest.mark.asyncio
-async def test_load_mappings(usb_mapper, temp_persistence_path):
-    """Test load mappings from disk."""
-    # Create a mappings file
-    data = {
-        "mappings": {
-            "port_test": {
-                "device_path": "/dev/ttyUSB0",
-                "vendor_id": "2341",
-                "serial_number": "12345",
-            }
-        },
-        "last_saved": "2026-01-03T10:00:00",
-    }
-
-    Path(temp_persistence_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(temp_persistence_path, "w") as f:
-        json.dump(data, f)
-
-    await usb_mapper.load_mappings()
-    # Note: load_mappings just logs, doesn't restore mappings
 
 
 @pytest.mark.asyncio
@@ -407,3 +290,52 @@ async def test_async_callback(usb_mapper, mock_pyserial_ports):
         await usb_mapper.refresh()
 
     assert callback_called
+
+
+@pytest.mark.asyncio
+async def test_baud_policy_skips_probing(temp_persistence_path, mock_pyserial_ports):
+    """A known board's baud comes from policy; 0 means "do not probe" (device will not be opened)."""
+    policy = {"2341": 115200, "1a86": 0}
+    mapper = USBPortMapper(
+        persistence_path=temp_persistence_path,
+        baud_policy=lambda info: policy.get(info.vendor_id),
+    )
+    with patch("serial.tools.list_ports.comports", return_value=mock_pyserial_ports), \
+            patch.object(mapper, "_detect_baud_rate_manual", new=AsyncMock(return_value=9600)) as probe:
+        await mapper.refresh()
+
+    probe.assert_not_called()
+    bauds = {info.device_path: info.detected_baud for info in mapper.port_id_to_device_info.values()}
+    assert bauds == {"/dev/ttyUSB0": 115200, "/dev/ttyUSB1": None}
+
+
+@pytest.mark.asyncio
+async def test_suppressed_board_callbacks_replayed_on_release(usb_mapper, mock_pyserial_ports):
+    """While a board re-enumerates during flashing its hotplug callbacks are held back, then replayed."""
+    connected, disconnected = [], []
+    usb_mapper.on_device_connected(lambda info: connected.append(info.device_path))
+    usb_mapper.on_device_disconnected(lambda info: disconnected.append(info.device_path))
+
+    with patch("serial.tools.list_ports.comports", return_value=mock_pyserial_ports):
+        await usb_mapper.refresh()
+    assert sorted(connected) == ["/dev/ttyUSB0", "/dev/ttyUSB1"]
+    connected.clear()
+
+    uno = next(i for i in usb_mapper.port_id_to_device_info.values() if i.device_path == "/dev/ttyUSB0")
+    keys = usb_mapper.suppress(uno)
+    assert "loc:1-1.1" in keys and "sn:12345" in keys
+
+    # Board disappears (bootloader touch) and comes back on a new path with the same USB location
+    with patch("serial.tools.list_ports.comports", return_value=[mock_pyserial_ports[1]]):
+        await usb_mapper.refresh()
+    returned = Mock(**{a: getattr(mock_pyserial_ports[0], a) for a in
+                       ("vid", "pid", "serial_number", "manufacturer", "product", "location", "description", "hwid")})
+    returned.device = "/dev/ttyACM0"
+    with patch("serial.tools.list_ports.comports", return_value=[returned, mock_pyserial_ports[1]]):
+        await usb_mapper.refresh()
+        assert connected == [] and disconnected == []
+
+        await usb_mapper.release(keys)
+
+    assert connected == ["/dev/ttyACM0"]
+    assert disconnected == []

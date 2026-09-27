@@ -1,239 +1,120 @@
 # RPi Hub Service
 
-FastAPI server for Raspberry Pi that bridges Arduino serial data to laptop over WiFi for Cornell Hyperloop electrical systems.
+Runs on each Raspberry Pi hub. It detects USB serial MCUs (Arduino, STM32), streams their serial
+output to the cloud service, and executes commands from the GUI (serial write, restart, flash).
 
-## Features
+Every Pi runs this same code. What differs per Pi is a **profile** (`HUB_PROFILE`) and its `.env`:
 
-- Automatic USB device detection with arduino-cli
-- WebSocket communication with server
-- Multiple simultaneous serial connections
-- Comprehensive JSON structured logging
-- 10MB circular buffer for backpressure handling
-- Health monitoring with system metrics
-- Flash firmware to connected devices (supports .ino compilation)
-- Hotplug device detection
+| Profile | Use |
+|---|---|
+| `lab-hub` | USB MCUs on lab Wi-Fi |
+| `cellular-hub` | USB MCUs; Wi-Fi preferred, cellular fallback handled by the uplink manager (`wifi-fallback-relay` repo) |
+| `dev-sim` | Simulated boards on a laptop, no hardware |
 
-## Prerequisites
+Setting up a Pi from scratch: `.claude/rpi-hub-setup.md` in the hyperloop-gui repository.
 
-- Python 3.11+
-- arduino-cli (for board detection and sketch compilation)
+## Architecture
 
-### Installing arduino-cli
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
+```
+src/
+  main.py            FastAPI app; starts/stops the runtime
+  runtime.py         Composition root: builds and wires every component from settings
+  config.py          config/config.yaml + profile overlay + ${ENV:default} substitution
+  uplink/            HubAgent (persistent WebSocket to the cloud) and its outbound buffer
+  bench/             Bench backend interface, USB backend, serial manager, USB mapper,
+                     command handler, tasks, flashing (arduino-cli)
+  sim/               Simulated bench backend (same interface as the USB backend)
+  health/            Health reporter and the uplink status reader
+  api/               Local debugging API
 ```
 
-Add to PATH:
-```bash
-export PATH=$PATH:$HOME/bin
-```
+- The **backend** (`bench/backend.py`) is the only thing that knows where devices come from.
+  `UsbBenchBackend` talks to real hardware; `SimBenchBackend` fakes it. The runtime, command
+  handler, tasks and API only use the interface, so a simulated hub exercises exactly the same
+  uplink and protocol code as a real one.
+- The **uplink** reconnects forever with capped backoff and keeps telemetry in a bounded buffer
+  while the cloud is unreachable (oldest telemetry is dropped first; task results and device events
+  are kept). After every reconnect the hub re-announces its open devices (`device_snapshot`).
+- Commands on the same port run one at a time; different ports run concurrently.
 
-Install required Arduino cores for compilation:
-```bash
-arduino-cli core update-index
-arduino-cli core install arduino:avr  # For Uno, Mega, Nano
-arduino-cli core install esp32:esp32  # For ESP32 (requires additional board manager URL)
-```
+## Running locally without hardware
 
-For ESP32 support, add the board manager URL first:
-```bash
-arduino-cli config init
-arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-arduino-cli core update-index
-arduino-cli core install esp32:esp32
-```
-
-## Installation
+Start cloud-services (see its README), then:
 
 ```bash
-git clone <repository-url>
-cd rpi-hub-service
+cd rpi-hub-server
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
+HUB_PROFILE=dev-sim python -m src.main
 ```
+
+With no `.env`, the dev-sim profile connects to `ws://localhost:8080/hub` as `rpi-bridge-01`
+with the cloud's development token. Run a second simulated hub with
+`HUB_ID=rpi-bridge-02 DEVICE_TOKEN=dev-token-rpi-bridge-02 API_PORT=8001`.
+The simulated boards stream sensor lines, echo serial writes, and complete restart/flash commands.
 
 ## Configuration
 
-1. Copy environment template:
-```bash
-cp .env.example .env
-```
+`config/config.yaml` holds the defaults; `config/profiles/<name>.yaml` is merged over it when
+`HUB_PROFILE=<name>` (or a path to a YAML file). `${VAR:default}` values come from the environment
+or `.env`. Secrets such as `DEVICE_TOKEN` belong in `.env` only.
 
-2. Edit `.env` with your settings:
-```env
-HUB_ID=rpi-bridge-01
-SERVER_ENDPOINT=ws://YOUR_CLOUD_SERVER_IP:8080/hub
-DEVICE_TOKEN=dev-token-rpi-bridge-01
-```
+Notable settings:
 
-**Important:** Replace `YOUR_CLOUD_SERVER_IP` with:
-- Your cloud service machine's IP address (e.g., `192.168.1.100`)
-- Or `localhost` if running both services on the same machine
+| Key | Default | Meaning |
+|---|---|---|
+| `hub.mode` | `bench` | `pod` (EtherCAT master) is reserved and rejected until implemented |
+| `hub.max_reconnect_attempts` | `0` | `0` = never stop reconnecting |
+| `bench.source` | `usb` | `sim` for simulated boards |
+| `bench.auto_connect` | `all` | `known_boards` opens only boards in the board registry |
+| `api.host` | `127.0.0.1` | The local API can flash MCUs and has no auth; keep it on loopback |
+| `uplink.status_file` | `/run/hyperloop-uplink/status.json` | Written by the uplink manager on the cellular hub |
 
-3. Adjust `config/config.yaml` as needed.
+## Local API
 
-## Running Locally
+For debugging on the Pi (`curl http://127.0.0.1:8000/...`). The GUI goes through the cloud.
 
-```bash
-uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
-```
+- `GET /health`, `GET /status` - liveness; full health report plus uplink agent state
+- `GET /ports`, `POST /ports/scan`, `GET /ports/{portId}` - detected devices
+- `GET /connections`, `POST /connections`, `DELETE /connections/{portId}` - serial sessions
+- `POST /tasks/write|flash|restart`, `GET /tasks`, `GET /tasks/{taskId}` - same commands the cloud sends
 
-## Deployment to rpi-bridge-01
+## WebSocket protocol (hub side)
 
-```bash
-ssh pi@rpi-bridge-01
-cd /opt/rpi-hub-service
-git pull
-source venv/bin/activate
-pip install -r requirements.txt
-# Restart service (systemd or supervisor)
-```
+Handshake (hub -> cloud), first message after connecting:
 
-## API Endpoints
-
-### Health
-- `GET /health` - Basic health check
-- `GET /status` - Detailed status with metrics
-
-### Ports
-- `GET /ports` - List all detected serial ports
-- `POST /ports/scan` - Trigger manual port scan
-- `GET /ports/{portId}` - Get specific port details
-
-### Connections
-- `POST /connections` - Open serial connection
-  ```json
-  {
-    "portId": "port-abc123",
-    "baudRate": 9600
-  }
-  ```
-- `DELETE /connections/{portId}` - Close connection
-- `GET /connections` - List active connections
-
-### Tasks
-- `POST /tasks/write` - Write data to serial port
-  ```json
-  {
-    "portId": "port-abc123",
-    "data": "Hello Arduino",
-    "encoding": "utf-8"
-  }
-  ```
-- `POST /tasks/flash` - Flash firmware to device (accepts .ino source or .hex binary)
-  ```json
-  {
-    "portId": "port-abc123",
-    "firmwareData": "base64-encoded-ino-or-hex-file",
-    "boardFqbn": "arduino:avr:uno"
-  }
-  ```
-  Note: boardFqbn is required for .ino source, optional for .hex (auto-detected)
-- `POST /tasks/restart` - Restart connected device
-  ```json
-  {
-    "portId": "port-abc123"
-  }
-  ```
-- `GET /tasks/{taskId}` - Get task status
-- `GET /tasks` - List all tasks
-
-## WebSocket Protocol
-
-Connect to `/ws/hub` with device token authentication.
-
-### Command Messages (Server → Hub)
 ```json
 {
-  "type": "command",
-  "command": {
-    "commandId": "cmd-123",
-    "commandType": "serial_write|flash|restart",
-    "portId": "port-abc123",
-    "params": {
-      "data": "...",
-      "encoding": "utf-8"
-    },
-    "priority": 5
-  }
-}
-```
-
-### Task Status Updates (Hub → Server)
-```json
-{
-  "type": "task_status",
+  "type": "hub_connect",
   "hubId": "rpi-bridge-01",
-  "timestamp": "2026-01-03T12:00:00Z",
-  "taskId": "cmd-123",
-  "status": "completed|failed|running",
-  "result": {...},
-  "error": "error message if failed"
+  "deviceToken": "...",
+  "timestamp": "2026-09-23T12:00:00Z",
+  "version": "1.1.0",
+  "capabilities": ["bench", "flash:ino", "flash:hex", "device_snapshot"],
+  "profile": {"name": "lab-hub", "mode": "bench", "uplink": null}
 }
 ```
 
-### Telemetry Data (Hub → Server)
-```json
-{
-  "type": "telemetry",
-  "hubId": "rpi-bridge-01",
-  "timestamp": "2025-01-03T12:00:00Z",
-  "portId": "port-abc123",
-  "sessionId": "session-xyz",
-  "data": "base64-encoded-serial-data"
-}
-```
+Hub -> cloud: `telemetry`, `health`, `device_event`, `task_status`. Cloud -> hub: `command`
+(`serial_write`, `flash`, `restart`, `close_connection`). The authoritative schemas are in
+`cloud-services/contracts/openapi.json`.
 
-### Message Types (Hub → Server)
-- `hub_connect` - Initial handshake
-- `telemetry` - Serial data from devices
-- `health` - System health metrics
-- `device_event` - Hotplug events
-- `task_status` - Task completion updates
-
-### Message Types (Server → Hub)
-- `command` - Execute task (flash, write, restart, etc.)
-
-## JSON Log Format
-
-All logs are JSON structured to stdout:
-
-```json
-{
-  "timestamp": "2026-01-03T10:00:00Z",
-  "level": "INFO",
-  "module": "serial_manager",
-  "event": "serial_read",
-  "port_id": "port_0",
-  "bytes": 64
-}
-```
-
-## Testing
+## Tests
 
 ```bash
 pytest tests/ -v
-pytest tests/ --cov=src --cov-report=html
 ```
+
+`tests/manual/` holds hardware diagnostics that are run by hand (not collected by pytest).
 
 ## Troubleshooting
 
-### Arduino not detected
-- Verify arduino-cli installation: `arduino-cli version`
-- Check USB permissions: `ls -l /dev/ttyUSB*`
-- Run port scan: `curl http://localhost:8000/ports/scan`
-
-### Connection fails
-- Check baud rate compatibility
-- Verify device not in use by another process
-- Review logs for retry attempts
-
-### WebSocket disconnects
-- Check network connectivity
-- Verify SERVER_ENDPOINT and DEVICE_TOKEN
-- Monitor reconnection attempts in logs
+| Symptom | Check |
+|---|---|
+| Hub never shows online | `journalctl -u rpi-hub-server -f`; look for `ws_rejected` (wrong `HUB_ID`/`DEVICE_TOKEN`) or connection errors (`SERVER_ENDPOINT`, network) |
+| Board detected but no data | `curl 127.0.0.1:8000/ports` shows it but `/connections` does not: auto-connect policy skipped it, or it failed to open (permissions: user must be in `dialout`) |
+| Flash fails | Task error in the GUI carries the arduino-cli output; check the core is installed (`arduino-cli core list`) |
 
 ## License
 

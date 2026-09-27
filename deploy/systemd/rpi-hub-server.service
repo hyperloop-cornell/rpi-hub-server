@@ -1,0 +1,19 @@
+[Unit]
+Description=Hyperloop RPi Hub Server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/opt/rpi-hub-server
+# HUB_PROFILE, HUB_ID, DEVICE_TOKEN and SERVER_ENDPOINT come from this file
+EnvironmentFile=/opt/rpi-hub-server/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/rpi-hub-server/venv/bin/python -m src.main
+Restart=always
+RestartSec=5
+StateDirectory=rpi-hub
+
+[Install]
+WantedBy=multi-user.target

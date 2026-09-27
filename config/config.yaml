@@ -1,27 +1,46 @@
+# Base configuration shared by every hub. Select a profile with HUB_PROFILE (see
+# config/profiles/); the profile is merged over this file. ${VAR:default} values come from
+# the environment or .env. Secrets (DEVICE_TOKEN) belong in .env only.
+
 hub:
   hub_id: ${HUB_ID:rpi-bridge-01}
   server_endpoint: ${SERVER_ENDPOINT:ws://localhost:8080/hub}
   device_token: "${DEVICE_TOKEN:}"
-  reconnect_interval: 5
-  max_reconnect_attempts: 10
+  reconnect_interval: ${RECONNECT_INTERVAL:5}
+  # 0 = keep reconnecting forever (recommended for unattended hubs)
+  max_reconnect_attempts: ${MAX_RECONNECT_ATTEMPTS:0}
+  # bench = USB MCUs. "pod" (EtherCAT master) is reserved and not implemented yet.
+  mode: ${HUB_MODE:bench}
 
 serial:
   default_baud_rate: ${DEFAULT_BAUD_RATE:9600}
   scan_interval: ${PORT_SCAN_INTERVAL:2}
   default_timeout: 1.0
   max_connections: 10
-  task_queue_size: 100
   connection_retry_attempts: ${CONNECTION_RETRY_ATTEMPTS:3}
   auto_connect: ${AUTO_CONNECT:true}
+
+bench:
+  # usb = real devices, sim = simulated devices (no hardware needed)
+  source: ${BENCH_SOURCE:usb}
+  # all = open every USB serial device; known_boards = only boards in config/boards.yaml
+  auto_connect: ${BENCH_AUTO_CONNECT:all}
 
 buffer:
   size_mb: ${BUFFER_SIZE_MB:10}
   warn_threshold: ${BUFFER_WARN_THRESHOLD:0.8}
+  # Keep telemetry produced while the cloud is unreachable (oldest telemetry dropped first)
+  telemetry_while_disconnected: true
 
 health:
   report_interval: ${HEALTH_REPORT_INTERVAL:30}
   cpu_threshold: 80.0
   memory_threshold: 85.0
+
+uplink:
+  # Written by the uplink manager (wifi-fallback-relay repo) on the cellular hub only
+  status_file: ${UPLINK_STATUS_FILE:/run/hyperloop-uplink/status.json}
+  stale_after_seconds: 30
 
 storage:
   artifact_cache_path: ${ARTIFACT_CACHE_PATH:/tmp/rpi-hub-artifacts}
@@ -30,7 +49,9 @@ storage:
   log_directory: ${LOG_DIRECTORY:/var/log/rpi-hub}
 
 api:
-  host: ${API_HOST:0.0.0.0}
+  # Local debugging API. Loopback only by default: it can write to and flash MCUs and has
+  # no authentication. Set API_HOST=0.0.0.0 only on a trusted network.
+  host: ${API_HOST:127.0.0.1}
   port: ${API_PORT:8000}
   cors_origins:
     - "*"

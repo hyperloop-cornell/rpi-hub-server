@@ -3,13 +3,14 @@ Base task class for all executable tasks.
 """
 
 import asyncio
-import uuid
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, Optional
 
-from ..logging_config import get_logger
+from src.logging_config import get_logger
+
+from ..backend import BenchError
 
 logger = get_logger(__name__)
 
@@ -59,7 +60,7 @@ class BaseTask(ABC):
         self.result: Optional[Dict[str, Any]] = None
         self.error: Optional[str] = None
         
-        self.created_at = datetime.utcnow()
+        self.created_at = datetime.now(timezone.utc)
         self.started_at: Optional[datetime] = None
         self.completed_at: Optional[datetime] = None
         
@@ -72,7 +73,6 @@ class BaseTask(ABC):
                 "command_type": self.command_type,
                 "port_id": self.port_id,
                 "priority": self.priority,
-                "params": self.params
             }
         )
     
@@ -97,7 +97,7 @@ class BaseTask(ABC):
         """
         try:
             self.status = TaskStatus.RUNNING
-            self.started_at = datetime.utcnow()
+            self.started_at = datetime.now(timezone.utc)
             
             logger.info(
                 f"Task started",
@@ -140,7 +140,7 @@ class BaseTask(ABC):
                 # Task completed
                 self.result = execute_task.result()
                 self.status = TaskStatus.COMPLETED
-                self.completed_at = datetime.utcnow()
+                self.completed_at = datetime.now(timezone.utc)
                 
                 duration_ms = (
                     (self.completed_at - self.started_at).total_seconds() * 1000
@@ -161,7 +161,9 @@ class BaseTask(ABC):
         except Exception as e:
             self.status = TaskStatus.FAILED
             self.error = str(e)
-            self.completed_at = datetime.utcnow()
+            self.completed_at = datetime.now(timezone.utc)
+            # Expected failures (bad input, device gone, tool errors) do not need a traceback
+            expected = isinstance(e, (ValueError, BenchError))
             
             logger.error(
                 f"Task failed: {e}",
@@ -171,7 +173,7 @@ class BaseTask(ABC):
                     "port_id": self.port_id,
                     "error": str(e)
                 },
-                exc_info=True
+                exc_info=not expected
             )
     
     def cancel(self) -> None:
@@ -194,7 +196,6 @@ class BaseTask(ABC):
             "task_id": self.task_id,
             "command_type": self.command_type,
             "port_id": self.port_id,
-            "params": self.params,
             "priority": self.priority,
             "status": self.status.value,
             "result": self.result,

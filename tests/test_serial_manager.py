@@ -6,12 +6,23 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import pytest
 import serial
 
-from src.serial_manager import (
+from src.bench.serial_manager import (
     Connection,
     ConnectionStatus,
     SerialManager,
-    Task,
+    SerialWriteError,
 )
+
+
+@pytest.fixture(autouse=True)
+def instant_sleep(monkeypatch):
+    """Skip the DTR-reset and retry delays."""
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(delay, *args, **kwargs):
+        await real_sleep(0)
+
+    monkeypatch.setattr("src.bench.serial_manager.asyncio.sleep", fast_sleep)
 
 
 @pytest.fixture
@@ -42,7 +53,6 @@ async def test_serial_manager_initialization(serial_manager):
     assert serial_manager.max_connections == 5
     assert serial_manager.connection_retry_attempts == 3
     assert len(serial_manager.active_connections) == 0
-    assert serial_manager.is_busy is False
 
 
 @pytest.mark.asyncio
@@ -85,7 +95,6 @@ async def test_start_and_stop(serial_manager):
     """Test starting and stopping serial manager."""
     await serial_manager.start()
     assert serial_manager._running is True
-    assert serial_manager._queue_processor_task is not None
 
     await serial_manager.stop()
     assert serial_manager._running is False
@@ -266,9 +275,11 @@ async def test_write_to_port(serial_manager, mock_serial):
         )
 
         data = b"Hello Arduino"
+        mock_serial.write.return_value = len(data)
         result = await serial_manager.write_to_port("port_0", data)
 
-        assert result is True
+        assert result == len(data)
+        assert serial_manager.get_connection("port_0").bytes_written == len(data)
         mock_serial.write.assert_called_once_with(data)
 
         await serial_manager.stop()
@@ -279,56 +290,12 @@ async def test_write_to_port_not_open(serial_manager):
     """Test writing to unopened port."""
     await serial_manager.start()
 
-    result = await serial_manager.write_to_port("port_0", b"test")
-
-    assert result is False
+    with pytest.raises(SerialWriteError):
+        await serial_manager.write_to_port("port_0", b"test")
 
     await serial_manager.stop()
 
 
-@pytest.mark.asyncio
-async def test_read_from_port(serial_manager, mock_serial):
-    """Test reading from serial port."""
-    mock_serial.read.return_value = b"Arduino response"
-
-    with patch("serial.Serial", return_value=mock_serial):
-        await serial_manager.start()
-
-        await serial_manager.open_connection(
-            session_id="session_123",
-            port_id="port_0",
-            device_path="/dev/ttyUSB0",
-            baud_rate=115200,
-        )
-
-        data = await serial_manager.read_from_port("port_0", size=100)
-
-        assert data == b"Arduino response"
-        mock_serial.read.assert_called_with(100)
-
-        await serial_manager.stop()
-
-
-@pytest.mark.asyncio
-async def test_read_from_port_with_timeout(serial_manager, mock_serial):
-    """Test reading with custom timeout."""
-    mock_serial.read.return_value = b"data"
-
-    with patch("serial.Serial", return_value=mock_serial):
-        await serial_manager.start()
-
-        await serial_manager.open_connection(
-            session_id="session_123",
-            port_id="port_0",
-            device_path="/dev/ttyUSB0",
-            baud_rate=115200,
-        )
-
-        await serial_manager.read_from_port("port_0", size=100, timeout=2.0)
-
-        assert mock_serial.timeout == 1.0  # Restored to original
-
-        await serial_manager.stop()
 
 
 @pytest.mark.asyncio
@@ -357,9 +324,11 @@ async def test_flush_port(serial_manager, mock_serial):
 async def test_data_callback(serial_manager, mock_serial):
     """Test data callback invocation."""
     callback_data = []
+    received = asyncio.Event()
 
     async def data_callback(port_id, session_id, data):
         callback_data.append((port_id, session_id, data))
+        received.set()
 
     serial_manager.set_data_callback(data_callback)
 
@@ -375,50 +344,12 @@ async def test_data_callback(serial_manager, mock_serial):
             baud_rate=115200,
         )
 
-        # Let reader task run
-        await asyncio.sleep(0.1)
-
-        # Should have received data via callback
-        assert len(callback_data) > 0
+        await asyncio.wait_for(received.wait(), timeout=2)
+        assert callback_data[0] == ("port_0", "session_123", b"callback test")
 
         await serial_manager.stop()
 
 
-@pytest.mark.asyncio
-async def test_add_task(serial_manager):
-    """Test adding task to queue."""
-    await serial_manager.start()
-
-    task = Task(
-        task_id="task_123",
-        task_type="test",
-        port_id="port_0",
-    )
-
-    task_id = await serial_manager.add_task(task)
-
-    assert task_id == "task_123"
-    assert serial_manager.task_queue.qsize() == 1
-
-    await serial_manager.stop()
-
-
-@pytest.mark.asyncio
-async def test_add_task_queue_full(serial_manager):
-    """Test adding task when queue is full."""
-    await serial_manager.start()
-
-    # Fill queue
-    for i in range(10):
-        task = Task(task_id=f"task_{i}", task_type="test", port_id="port_0")
-        await serial_manager.add_task(task)
-
-    # Try to add one more
-    with pytest.raises(asyncio.QueueFull):
-        task = Task(task_id="task_overflow", task_type="test", port_id="port_0")
-        await serial_manager.add_task(task)
-
-    await serial_manager.stop()
 
 
 @pytest.mark.asyncio
@@ -521,15 +452,50 @@ async def test_get_port_error_count(serial_manager, mock_serial):
 
 
 @pytest.mark.asyncio
-async def test_task_dataclass():
-    """Test Task dataclass."""
-    task = Task(
-        task_id="task_456",
-        task_type="flash",
-        port_id="port_0",
-        priority=1,
-    )
+async def test_open_without_reset_skips_dtr(serial_manager, mock_serial):
+    """Native-USB boards are opened without a DTR pulse."""
+    with patch("serial.Serial", return_value=mock_serial):
+        await serial_manager.start()
+        await serial_manager.open_connection("s", "port_0", "/dev/ttyACM0", 115200, reset_on_open=False)
+        assert mock_serial.dtr is not False  # never pulled low
+        await serial_manager.stop()
 
-    assert task.get_id() == "task_456"
-    assert task.task_type == "flash"
-    assert task.status == "pending"
+
+@pytest.mark.asyncio
+async def test_read_error_closes_connection_and_notifies(serial_manager, mock_serial):
+    """A failing read unregisters the connection (no self-await) and reports the loss."""
+    lost = asyncio.Event()
+    seen = []
+
+    async def on_lost(port_id, session_id):
+        seen.append((port_id, session_id))
+        lost.set()
+
+    mock_serial.read.side_effect = serial.SerialException("device reports readiness to read but returned no data")
+    serial_manager.set_disconnect_callback(on_lost)
+    with patch("serial.Serial", return_value=mock_serial):
+        await serial_manager.start()
+        await serial_manager.open_connection("session_1", "port_0", "/dev/ttyUSB0", 9600)
+        await asyncio.wait_for(lost.wait(), timeout=2)
+
+    assert seen == [("port_0", "session_1")]
+    assert serial_manager.get_connection("port_0") is None
+    await serial_manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_bytes_read_counted(serial_manager, mock_serial):
+    received = asyncio.Event()
+    mock_serial.read.side_effect = [b"abc", b"de"] + [b""] * 1000
+
+    def on_data(port_id, session_id, data):
+        if serial_manager.get_connection("port_0").bytes_read >= 5:
+            received.set()
+
+    serial_manager.set_data_callback(on_data)
+    with patch("serial.Serial", return_value=mock_serial):
+        await serial_manager.start()
+        await serial_manager.open_connection("s", "port_0", "/dev/ttyUSB0", 9600)
+        await asyncio.wait_for(received.wait(), timeout=2)
+        assert serial_manager.get_connection("port_0").bytes_read == 5
+        await serial_manager.stop()
